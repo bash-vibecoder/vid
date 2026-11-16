@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.3 — 2026-11-17
+
+### Fixed
+
+- Replaced the legacy launcher icon with an adaptive icon to remove the launcher-added white backing.
+- Used a solid black background and blue V for adaptive, round, and legacy launcher icons.
+- Reduced the V to 75% of its previous size while keeping it centered.
+
+### Changed
+
+- Removed personal device model references from the documentation and kept the build environment described as an Ubuntu ARM64 chroot.
+
 ## 1.4.2 — 2026-11-16
 
 ### Changed

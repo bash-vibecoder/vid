@@ -15,6 +15,8 @@ APocketVid plays videos stored on your Android device. It is fully offline and h
 
 The dark blue interface places Previous, Play/Pause, and Next in a slim glass bar along the bottom edge. Two thin blue pill dividers separate the buttons. Each button has a minimum 48 dp touch target, and Previous/Next follow the folder and current sorting order.
 
+The launcher icon uses a solid black background with a blue V. Adaptive and round launcher shapes use the same black background.
+
 | Action | Control |
 | --- | --- |
 | Show or hide playback controls | Tap the video once |
@@ -47,7 +49,7 @@ Thumbnail extraction uses a separate private process with bundled FFmpeg librari
 
 ## Compatibility and permissions
 
-- Android 8 or later, with ARM64 support; designed and tested on Poco X3 Pro/vayu.
+- Android 8 or later, with ARM64 support.
 - Video access is requested on first launch.
 - A first-run battery optimization prompt provides the requested battery setting.
 - No Internet permission.
