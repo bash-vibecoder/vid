@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.4 — 2026-11-17
+
+### Added
+
+- Orange titles mark each folder's last played video and the folder itself. Individual positions and highlights remain saved when playing a different folder, including brief playback sessions. Completed videos retain their last played highlight.
+- A playback touch lock blocks accidental taps, double taps, swipes, and Back. A small lock at the top left unlocks the controls.
+- Touch lock persists across background recovery, activity state restoration, and automatic video changes.
+
+### Changed
+
+- Refresh resume targets and their colors immediately when returning to the library, including videos with unknown duration.
+- Reset title colors when list rows are reused, and track last played highlights independently from resume positions.
+- Arrange top playback controls in two rows on narrow screens to keep the lock and track buttons accessible.
+- Extend the device smoke test to cover touch lock, background lock recovery, and resume highlighting with reused rows.
+
+### Validation
+
+- Eight unit tests and eleven device smoke checks passed, including touch lock, background recovery, preview recovery, and independent folder/video highlights. Lint reported no errors.
+
 ## 1.4.3 — 2026-11-17
 
 ### Fixed

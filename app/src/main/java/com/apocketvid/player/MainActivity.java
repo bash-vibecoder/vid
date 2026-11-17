@@ -147,6 +147,9 @@ public final class MainActivity extends Activity {
     private TextView loadingMessage;
     private View controlsTop;
     private View controlsBottom;
+    private FrameLayout touchLockOverlay;
+    private ImageButton unlockButton;
+    private boolean touchLocked;
     private VideoItem currentVideo;
     private int currentIndex = -1;
     private int durationMs;
@@ -246,6 +249,7 @@ public final class MainActivity extends Activity {
                     state.getLong("playerSize", 0L));
             restored.dateModified = state.getLong("playerModified", 0L);
             openVideo(restored, state.getInt("playerPosition", 0));
+            setTouchLocked(state.getBoolean("touchLocked", false));
         }
 
         prepareEngine();
@@ -359,11 +363,13 @@ public final class MainActivity extends Activity {
             out.putLong("playerSize", currentVideo.size);
             out.putLong("playerModified", currentVideo.dateModified);
             out.putInt("playerPosition", safePosition());
+            out.putBoolean("touchLocked", touchLocked);
         }
         super.onSaveInstanceState(out);
     }
 
     @Override public void onBackPressed() {
+        if (playerRoot != null && touchLocked) return;
         if (playerRoot != null) {
             showLibrary();
         } else if (folderOpen) {
@@ -595,6 +601,9 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(hideAdjustmentHud);
         handler.removeCallbacks(prepareTimeout);
         restoreScreenBrightness();
+        touchLocked = false;
+        touchLockOverlay = null;
+        unlockButton = null;
         playerRoot = null;
         releaseMediaPlayer();
         previewLoader.setPlaybackActive(!activityVisible);
@@ -609,7 +618,7 @@ public final class MainActivity extends Activity {
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
         setContentView(libraryRoot);
-        updateLibrary();
+        applyFilters();
     }
 
     private void requestVideoPermission() {
@@ -909,7 +918,7 @@ public final class MainActivity extends Activity {
         boolean allowed = hasVideoPermission();
         String lastUri = preferences.getString("lastUri", null);
         int lastPosition = preferences.getInt("lastPosition", 0);
-        boolean hasResume = allowed && lastUri != null && lastPosition >= 3000 && findVideo(Uri.parse(lastUri)) != null;
+        boolean hasResume = allowed && lastUri != null && lastPosition >= 0 && findVideo(Uri.parse(lastUri)) != null;
         if (resumeLastButton != null) {
             resumeLastButton.setVisibility(hasResume ? View.VISIBLE : View.GONE);
             resumeLastButton.setContentDescription(hasResume ? "Resume " + preferences.getString("lastTitle", "last video") : "Resume last video");
@@ -1029,6 +1038,7 @@ public final class MainActivity extends Activity {
 
             FolderItem folder = getItem(position);
             holder.title.setText(folderLabel(folder.path));
+            holder.title.setTextColor(folder.lastPlayedVideo != null ? ORANGE : INK);
             String detail = folder.videos.size() + (folder.videos.size() == 1 ? " video" : " videos")
                     + "  /  " + formatSize(folder.totalSize);
             String parentPath = parentFolderLabel(folder.path);
@@ -1060,6 +1070,7 @@ public final class MainActivity extends Activity {
         if (currentVideo == null || preferences == null) return;
         int position = safePosition();
         savedPositionMs = position;
+        preferences.edit().putString("lastPlayedUri:" + currentVideo.folder, currentVideo.uri.toString()).apply();
         if (durationMs > 0 && position >= durationMs - 1500) {
             clearResumePosition(currentVideo);
             return;
@@ -1133,11 +1144,17 @@ public final class MainActivity extends Activity {
             }
             VideoItem item = getItem(position);
             holder.title.setText(item.title);
+            holder.title.setTextColor(isLastPlayedVideo(item) ? ORANGE : INK);
             holder.meta.setText(folderLabel(item.folder) + "  /  " + formatSize(item.size)
                     + "  /  " + formatTime((int) item.duration));
             requestThumbnail(item, holder.thumbnail);
             return convertView;
         }
+    }
+
+    private boolean isLastPlayedVideo(VideoItem item) {
+        String fallback = preferences.getString(resumeUriKey(item.folder), null);
+        return item.uri.toString().equals(preferences.getString("lastPlayedUri:" + item.folder, fallback));
     }
 
     private static final class RowHolder {
@@ -1203,6 +1220,7 @@ public final class MainActivity extends Activity {
         long totalSize;
         VideoItem previewVideo;
         VideoItem resumeVideo;
+        VideoItem lastPlayedVideo;
         int resumePosition;
 
         FolderItem(String path) { this.path = path; }
@@ -1216,14 +1234,18 @@ public final class MainActivity extends Activity {
         }
 
         void loadResume(SharedPreferences preferences) {
+            resumeVideo = null;
+            lastPlayedVideo = null;
+            resumePosition = 0;
             String uri = preferences.getString("resumeUri:" + path, null);
+            String playedUri = preferences.getString("lastPlayedUri:" + path, uri);
             int position = preferences.getInt("resumePosition:" + path, 0);
-            if (uri == null || position < 3000) return;
             for (VideoItem video : videos) {
-                if (video.uri.toString().equals(uri) && position < video.duration - 1500) {
+                if (video.uri.toString().equals(playedUri)) lastPlayedVideo = video;
+                if (video.uri.toString().equals(uri) && position >= 0
+                        && (video.duration <= 0 || position < video.duration - 1500)) {
                     resumeVideo = video;
                     resumePosition = position;
-                    return;
                 }
             }
         }
@@ -1252,7 +1274,7 @@ public final class MainActivity extends Activity {
         speed = 1.0f;
         speedIndex = 0;
         seeking = false;
-        controlsVisible = true;
+        controlsVisible = !touchLocked;
         pausedForBackground = false;
         playWhenReady = true;
         mediaPrepared = false;
@@ -1296,24 +1318,29 @@ public final class MainActivity extends Activity {
         loadingPanel = loading;
         playerRoot.addView(loading, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
 
-        LinearLayout top = horizontal();
+        LinearLayout top = vertical();
         top.setPadding(dp(8), dp(4), dp(8), dp(4));
         top.setBackground(glassBackground(18));
         controlsTop = top;
         FrameLayout.LayoutParams topParams = new FrameLayout.LayoutParams(-1, -2, Gravity.TOP);
         topParams.setMargins(dp(12), dp(12), dp(12), 0);
         playerRoot.addView(top, topParams);
-        top.addView(iconButton(android.R.drawable.ic_menu_close_clear_cancel, "Back to videos", true, v -> showLibrary()));
+        LinearLayout heading = horizontal();
+        LinearLayout trackControls = horizontal();
+        heading.addView(iconButton(android.R.drawable.ic_menu_close_clear_cancel, "Back to videos", true, v -> showLibrary()));
+        ImageButton lock = iconButton(R.drawable.ic_lock, "Lock playback touches", true, v -> setTouchLocked(true));
+        heading.addView(lock, new LinearLayout.LayoutParams(dp(48), dp(48)));
         playerTitle = text(currentVideo.title, 15, Color.WHITE, true);
         playerTitle.setSingleLine(true);
         playerTitle.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         LinearLayout.LayoutParams playerTitleParams = new LinearLayout.LayoutParams(0, -2, 1);
         playerTitleParams.leftMargin = dp(8);
-        top.addView(playerTitle, playerTitleParams);
+        heading.addView(playerTitle, playerTitleParams);
+        heading.addView(iconButton(android.R.drawable.ic_menu_rotate, "Toggle screen orientation", true, v -> toggleOrientation()));
         audioButton = playerTextButton("Audio", "Select audio track", v -> showTrackSelection(false));
-        top.addView(audioButton, new LinearLayout.LayoutParams(dp(52), dp(44)));
+        trackControls.addView(audioButton, new LinearLayout.LayoutParams(dp(52), dp(44)));
         subtitleButton = playerTextButton("CC", "Select subtitle track", v -> showTrackSelection(true));
-        top.addView(subtitleButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        trackControls.addView(subtitleButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
         speedButton = text("1.0x", 14, Color.WHITE, true);
         speedButton.setGravity(Gravity.CENTER);
         speedButton.setContentDescription("Playback speed");
@@ -1321,8 +1348,18 @@ public final class MainActivity extends Activity {
         speedButton.setBackground(new RippleDrawable(
                 ColorStateList.valueOf(0x44ffffff), rounded(Color.TRANSPARENT, 5), null));
         speedButton.setOnClickListener(v -> cycleSpeed());
-        top.addView(speedButton, new LinearLayout.LayoutParams(-2, dp(44)));
-        top.addView(iconButton(android.R.drawable.ic_menu_rotate, "Toggle screen orientation", true, v -> toggleOrientation()));
+        trackControls.addView(speedButton, new LinearLayout.LayoutParams(-2, dp(44)));
+        top.addView(heading, new LinearLayout.LayoutParams(-1, dp(48)));
+        LinearLayout.LayoutParams trackParams = new LinearLayout.LayoutParams(-2, dp(44));
+        trackParams.gravity = Gravity.END;
+        top.addView(trackControls, trackParams);
+        top.addOnLayoutChangeListener((view, left, topEdge, right, bottomEdge, oldLeft, oldTop, oldRight, oldBottom) -> {
+            boolean wide = right - left >= dp(600);
+            int orientation = wide ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL;
+            if (top.getOrientation() == orientation) return;
+            top.setOrientation(orientation);
+            heading.setLayoutParams(new LinearLayout.LayoutParams(wide ? 0 : -1, dp(48), wide ? 1 : 0));
+        });
 
         LinearLayout bottom = vertical();
         bottom.setPadding(dp(16), dp(2), dp(16), dp(2));
@@ -1384,11 +1421,13 @@ public final class MainActivity extends Activity {
         GestureDetector gestures = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override public boolean onDown(MotionEvent event) { return true; }
             @Override public boolean onSingleTapConfirmed(MotionEvent event) {
+                if (touchLocked) return true;
                 setControlsVisible(!controlsVisible);
                 if (controlsVisible) scheduleHideControls();
                 return true;
             }
             @Override public boolean onDoubleTap(MotionEvent event) {
+                if (touchLocked) return true;
                 float edgeWidth = videoLayout.getWidth() / 3f;
                 if (event.getX() < edgeWidth) {
                     seekBy(-10000);
@@ -1402,6 +1441,7 @@ public final class MainActivity extends Activity {
                 return true;
             }
             @Override public boolean onScroll(MotionEvent start, MotionEvent current, float distanceX, float distanceY) {
+                if (touchLocked) return true;
                 float dx = current.getX() - start.getX();
                 float dy = start.getY() - current.getY();
                 if (activeGesture == GESTURE_NONE) {
@@ -1446,11 +1486,25 @@ public final class MainActivity extends Activity {
             }
         });
         gestureLayer.setOnTouchListener((view, event) -> {
+            if (touchLocked) return true;
             gestures.onTouchEvent(event);
             if (event.getActionMasked() == MotionEvent.ACTION_UP) finishPlayerGesture(true);
             else if (event.getActionMasked() == MotionEvent.ACTION_CANCEL) finishPlayerGesture(false);
             return true;
         });
+        touchLockOverlay = new FrameLayout(this);
+        touchLockOverlay.setClickable(true);
+        touchLockOverlay.setOnTouchListener((view, event) -> true);
+        playerRoot.addView(touchLockOverlay, new FrameLayout.LayoutParams(-1, -1));
+        unlockButton = iconButton(R.drawable.ic_lock, "Unlock playback touches", true, v -> setTouchLocked(false));
+        unlockButton.setPadding(dp(14), dp(14), dp(14), dp(14));
+        unlockButton.setImageTintList(ColorStateList.valueOf(ACCENT));
+        unlockButton.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33ffffff),
+                rounded(0x99000000, 24), null));
+        FrameLayout.LayoutParams unlockParams = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.TOP | Gravity.LEFT);
+        unlockParams.setMargins(dp(12), dp(12), 0, 0);
+        touchLockOverlay.addView(unlockButton, unlockParams);
+        setControlsVisible(controlsVisible);
         setContentView(playerRoot);
     }
 
@@ -1555,6 +1609,7 @@ public final class MainActivity extends Activity {
                 if (firstStart) {
                     // start-time already handles resume; seeking here again decodes the same GOP twice.
                     pendingSeekMs = 0;
+                    persistResumePosition();
                     if (speed != 1f) player.setRate(speed);
                     restoreTrackSelections(player);
                     loadSavedExternalSubtitle();
@@ -2004,14 +2059,32 @@ public final class MainActivity extends Activity {
     }
 
     private void setControlsVisible(boolean visible) {
+        visible = visible && !touchLocked;
         controlsVisible = visible;
         if (controlsTop != null) controlsTop.setVisibility(visible ? View.VISIBLE : View.GONE);
         if (controlsBottom != null) controlsBottom.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (touchLockOverlay != null) touchLockOverlay.setVisibility(touchLocked ? View.VISIBLE : View.GONE);
+    }
+
+    private void setTouchLocked(boolean locked) {
+        touchLocked = locked;
+        activeGesture = GESTURE_NONE;
+        seeking = false;
+        handler.removeCallbacks(hideControls);
+        handler.removeCallbacks(hideAdjustmentHud);
+        if (adjustmentHud != null) adjustmentHud.setVisibility(View.GONE);
+        setControlsVisible(!locked);
+        if (touchLockOverlay != null) {
+            touchLockOverlay.bringToFront();
+            if (locked) unlockButton.requestFocus();
+        }
+        applyImmersiveMode();
+        if (!locked) scheduleHideControls();
     }
 
     private void scheduleHideControls() {
         handler.removeCallbacks(hideControls);
-        if (playWhenReady && !seeking) handler.postDelayed(hideControls, 3200);
+        if (playWhenReady && !seeking && !touchLocked) handler.postDelayed(hideControls, 3200);
     }
 
     private int safePosition() {
@@ -2110,7 +2183,7 @@ public final class MainActivity extends Activity {
     }
 
     private void showAdjustmentHud(String message) {
-        if (adjustmentHud == null) return;
+        if (adjustmentHud == null || touchLocked) return;
         adjustmentHud.setText(message);
         adjustmentHud.setVisibility(View.VISIBLE);
         handler.removeCallbacks(hideAdjustmentHud);

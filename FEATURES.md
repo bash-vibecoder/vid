@@ -9,6 +9,7 @@ APocketVid plays videos stored on your Android device. It is fully offline and h
 - Video previews are saved in app storage and reused on later launches, with a 96 MB limit.
 - A folder's Resume button continues that folder's saved video.
 - The orange circular play button resumes the most recently played video.
+- Each folder's last played video has an orange title, and its folder stays orange on the home screen. Playing another folder keeps earlier folders' saved positions and highlights. Brief playback sessions are remembered, and the last played highlight remains after completion.
 - Playback positions and track choices are remembered per video.
 
 ## Player controls
@@ -30,8 +31,12 @@ The launcher icon uses a solid black background with a blue V. Adaptive and roun
 | Select an embedded audio track | Tap Audio |
 | Select or load subtitles | Tap CC |
 | Change orientation | Use the orientation button |
+| Lock playback touches | Tap the lock in the top bar |
+| Unlock playback touches | Tap the small lock at the top left |
 
 Portrait and landscape videos are detected automatically. Controls stay visible when paused. When the app leaves the foreground, it saves the current position; returning recreates the video output and restores playback state.
+
+Touch lock hides the playback controls and prevents taps, double taps, swipes, or Back from operating them. Only the top-left unlock button accepts player touches while locked. The lock stays active after background recovery and when the player advances to another video. Returning to the library clears it. The top controls use two rows on narrow screens so all buttons remain accessible.
 
 ## Audio, video, and subtitles
 
