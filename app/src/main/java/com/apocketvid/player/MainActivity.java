@@ -1038,7 +1038,8 @@ public final class MainActivity extends Activity {
 
             FolderItem folder = getItem(position);
             holder.title.setText(folderLabel(folder.path));
-            holder.title.setTextColor(folder.lastPlayedVideo != null ? ORANGE : INK);
+            String lastPlayedFolder = preferences.getString("lastPlayedFolder", preferences.getString("lastFolder", null));
+            holder.title.setTextColor(folder.lastPlayedVideo != null && folder.path.equals(lastPlayedFolder) ? ORANGE : INK);
             String detail = folder.videos.size() + (folder.videos.size() == 1 ? " video" : " videos")
                     + "  /  " + formatSize(folder.totalSize);
             String parentPath = parentFolderLabel(folder.path);
@@ -1070,7 +1071,8 @@ public final class MainActivity extends Activity {
         if (currentVideo == null || preferences == null) return;
         int position = safePosition();
         savedPositionMs = position;
-        preferences.edit().putString("lastPlayedUri:" + currentVideo.folder, currentVideo.uri.toString()).apply();
+        preferences.edit().putString("lastPlayedUri:" + currentVideo.folder, currentVideo.uri.toString())
+                .putString("lastPlayedFolder", currentVideo.folder).apply();
         if (durationMs > 0 && position >= durationMs - 1500) {
             clearResumePosition(currentVideo);
             return;

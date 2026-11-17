@@ -9,7 +9,7 @@ APocketVid plays videos stored on your Android device. It is fully offline and h
 - Video previews are saved in app storage and reused on later launches, with a 96 MB limit.
 - A folder's Resume button continues that folder's saved video.
 - The orange circular play button resumes the most recently played video.
-- Each folder's last played video has an orange title, and its folder stays orange on the home screen. Playing another folder keeps earlier folders' saved positions and highlights. Brief playback sessions are remembered, and the last played highlight remains after completion.
+- Only the latest played folder is orange on the home screen. Playing a different folder turns the previous folder white. Inside each folder, its own last played video stays orange and keeps its saved resume position. Brief playback sessions are remembered, and last played highlights remain after completion.
 - Playback positions and track choices are remembered per video.
 
 ## Player controls

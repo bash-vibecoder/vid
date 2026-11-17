@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.5 — 2026-11-17
+
+### Changed
+
+- Only the most recently played folder is orange on the home screen. Playing a different folder resets the previous folder's title to white.
+- Keep individual resume positions and the orange last played video inside each folder.
+- Remember the latest folder independently from resume position so completing a video keeps the correct folder highlighted.
+
+### Validation
+
+- Eight unit tests and eleven device smoke checks passed, including changing the latest folder, resetting reused row colors, keeping individual resume positions, and retaining the latest folder highlight after completion. Lint reported no errors.
+
 ## 1.4.4 — 2026-11-17
 
 ### Added

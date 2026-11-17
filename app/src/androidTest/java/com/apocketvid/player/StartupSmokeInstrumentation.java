@@ -296,6 +296,7 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             call("showLibrary", new Class<?>[0]);
             SharedPreferences prefs = target.getSharedPreferences("player", Context.MODE_PRIVATE);
             require(prefs.contains("resumePosition:Validation"), "Playback did not save a resumable position");
+            require("Validation".equals(prefs.getString("lastPlayedFolder", null)), "Playback did not save the latest folder");
             ListView list = (ListView) field("videoList");
             BaseAdapter folders = (BaseAdapter) field("folderAdapter");
             View row = folders.getView(1, null, list);
@@ -308,11 +309,12 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             assertRowColor(row, "Validation video", true);
             row = videos.getView(0, row, list);
             assertRowColor(row, "Other video", false);
-            // Each folder keeps its own highlight, including a newly started video.
+            // Each folder keeps its video highlight; only the latest home folder stays orange.
             prefs.edit().putString("resumeUri:Validation", Uri.fromFile(secondFixture).toString())
                     .putString("lastPlayedUri:Validation", Uri.fromFile(secondFixture).toString())
                     .putInt("resumePosition:Validation", 200)
                     .putString("resumeUri:Other folder", unknownUri.toString()).putInt("resumePosition:Other folder", 5000)
+                    .putString("lastPlayedFolder", "Other folder")
                     .putString("lastUri", unknownUri.toString()).putInt("lastPosition", 5000).apply();
             call("applyFilters", new Class<?>[0]);
             row = videos.getView(0, row, list);
@@ -325,17 +327,31 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             row = folders.getView(0, null, list);
             assertRowColor(row, "Other folder", true);
             row = folders.getView(1, row, list);
-            assertRowColor(row, "Validation", true);
-            // Completion clears the resume action, while the last played title stays orange.
+            assertRowColor(row, "Validation", false);
+            require(prefs.getInt("resumePosition:Validation", -1) == 200
+                    && prefs.getInt("resumePosition:Other folder", -1) == 5000, "Switching folders lost a saved position");
+            // An upgrade uses the previous global folder until another video is played.
+            prefs.edit().remove("lastPlayedFolder").putString("lastFolder", "Other folder").apply();
+            assertRowColor(folders.getView(0, row, list), "Other folder", true);
+            row = folders.getView(1, null, list);
+            assertRowColor(row, "Validation", false);
+            // Switching back moves the home highlight without clearing the other folder's resume.
             prefs.edit().putInt("resumePosition:Validation", 29900)
+                    .putString("lastPlayedFolder", "Validation")
                     .putString("lastUri", Uri.fromFile(secondFixture).toString()).putInt("lastPosition", 29900).apply();
             call("applyFilters", new Class<?>[0]);
+            assertRowColor(folders.getView(0, row, list), "Other folder", false);
             View completedFolder = folders.getView(1, row, list);
             assertRowColor(completedFolder, "Validation", true);
             View resume = findDescription(completedFolder, "Resume Validation");
             require(resume != null && resume.getVisibility() != View.VISIBLE, "Completed video still has a resume action");
             call("enterFolder", new Class<?>[] {String.class}, "Validation");
             assertRowColor(videos.getView(0, null, list), "Other video", true);
+            call("clearResumePosition", new Class<?>[] {second.getClass()}, second);
+            activity.onBackPressed();
+            assertRowColor(folders.getView(1, null, list), "Validation", true);
+            require(!prefs.contains("lastUri"), "Completion did not clear the global resume target");
+            require(prefs.getInt("resumePosition:Other folder", -1) == 5000, "Completion cleared another folder's resume");
             require(!Boolean.TRUE.equals(field("touchLocked")), "Returning to the library kept touch lock active");
         });
     }
