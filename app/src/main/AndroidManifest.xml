@@ -16,6 +16,11 @@
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <service
+            android:name=".ScrubService"
+            android:exported="false"
+            android:process=":scrub"
+            android:stopWithTask="true" />
+        <service
             android:name=".PreviewService"
             android:exported="false"
             android:process=":previews"

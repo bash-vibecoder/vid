@@ -180,7 +180,7 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             checkLiveSeek();
             passed(report, "swipeSeekPreviewsBeforeRelease");
             checkContinuousSeek(video, constructor);
-            passed(report, "continuousSwipeSeekRendersSoftwareAndHardwarePlus");
+            passed(report, "continuousSwipeSeekRendersAllDecodersBothDirections");
             passed(report, "seekTimerMatchesDecodedFrames");
             passed(report, "seekingKeepsPlaybackAndVolumeEnabled");
             checkBoostedVolume();
@@ -290,7 +290,7 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             long deadline = SystemClock.uptimeMillis() + 1800;
             AtomicBoolean previewed = new AtomicBoolean();
             while (!previewed.get() && SystemClock.uptimeMillis() < deadline) {
-                onMain(() -> previewed.set((Integer) call("safePosition", new Class<?>[0]) > start.get() + 3000));
+                onMain(() -> previewed.set((Integer) field("displayedSeekPositionMs") > start.get() + 3000));
                 Thread.sleep(60);
             }
             require(previewed.get(), "Video did not seek while the finger was still down");
@@ -319,79 +319,30 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
         Method open = MainActivity.class.getDeclaredMethod("openVideo", video.getClass(), int.class);
         open.setAccessible(true);
         try {
-            onMain(() -> invoke(open, video, 2000));
+            // Start at zero so the initial VLC resume jump cannot look like a drag seek.
+            onMain(() -> invoke(open, video, 0));
             awaitPlayerPrepared();
-            for (int mode : new int[] {0, 2}) {
+            long previewDeadline = SystemClock.uptimeMillis() + 5000;
+            AtomicBoolean previewReady = new AtomicBoolean();
+            while (!previewReady.get() && SystemClock.uptimeMillis() < previewDeadline) {
+                onMain(() -> {
+                    ScrubPreview preview = (ScrubPreview) field("scrubPreview");
+                    previewReady.set(preview != null && preview.isReady());
+                });
+                Thread.sleep(20);
+            }
+            require(previewReady.get(), "Scrub decoder did not start");
+            checkScrubDirection(-1, 1);
+            for (int mode : new int[] {0, 1, 2}) {
                 onMain(() -> call("setDecoderMode", new Class<?>[] {int.class}, mode));
                 awaitPlayerPrepared();
                 onMain(() -> call("seekTo", new Class<?>[] {int.class}, 2000));
                 awaitSeekPosition(2000);
                 awaitMovingVideo();
-                AtomicReference<Long> down = new AtomicReference<>();
-                AtomicReference<Integer> targetPosition = new AtomicReference<>();
-                AtomicReference<Integer> initialVolume = new AtomicReference<>();
-                java.util.HashSet<Integer> pictures = new java.util.HashSet<>();
-                int previewUpdates = 0;
-                int lastPreview = -1;
-                long lastPreviewAt = SystemClock.uptimeMillis();
-                long longestPreviewGap = 0;
-                onMain(() -> {
-                    org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
-                    initialVolume.set(player.getVolume());
-                    require(player.getAudioTrack() >= 0, "Streaming seek fixture has no audio track");
-                    call("setControlsVisible", new Class<?>[] {boolean.class}, false);
-                    View root = (View) field("playerRoot");
-                    down.set(SystemClock.uptimeMillis());
-                    dispatchTouch(root, down.get(), down.get(), MotionEvent.ACTION_DOWN,
-                            root.getWidth() * .12f, root.getHeight() * .45f);
-                });
-                try {
-                    for (int step = 1; step <= 32; step++) {
-                        final float fraction = .12f + .38f * step / 32f;
-                        onMain(() -> {
-                            View root = (View) field("playerRoot");
-                            dispatchTouch(root, down.get(), SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE,
-                                    root.getWidth() * fraction, root.getHeight() * .45f);
-                        });
-                        Thread.sleep(55);
-                        AtomicReference<Integer> preview = new AtomicReference<>();
-                        onMain(() -> preview.set((Integer) field("displayedSeekPositionMs")));
-                        if (preview.get() != lastPreview) {
-                            long now = SystemClock.uptimeMillis();
-                            if (lastPreview >= 0) longestPreviewGap = Math.max(longestPreviewGap, now - lastPreviewAt);
-                            lastPreviewAt = now;
-                            lastPreview = preview.get();
-                            previewUpdates++;
-                        }
-                        if (step % 8 == 0) {
-                            pictures.add(videoFrameSignature());
-                            requireSeekTimerMatchesPicture();
-                            onMain(() -> {
-                                org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
-                                require(Boolean.TRUE.equals(field("playWhenReady")), "Seeking changed playback intent to paused");
-                                require(player.isPlaying(), "Seeking paused native video playback");
-                                require(player.getVolume() == initialVolume.get(), "Seeking muted or changed audio volume");
-                            });
-                        }
-                    }
-                    require(pictures.size() > 1, "Picture froze during continuous forward seeking in mode " + mode);
-                    Bundle metrics = new Bundle();
-                    metrics.putInt("seekPreviewUpdatesMode" + mode, previewUpdates);
-                    metrics.putLong("seekLongestPreviewGapMsMode" + mode, longestPreviewGap);
-                    sendStatus(0, metrics);
-                    require(previewUpdates >= 8, "Too few rendered seek updates during a continuous drag in mode " + mode);
-                    require(longestPreviewGap <= 750, "Rendered seek updates stalled for " + longestPreviewGap + " ms in mode " + mode);
-                    onMain(() -> targetPosition.set((Integer) field("gestureTargetPosition")));
-                    awaitSeekPosition(targetPosition.get());
-                    requireSeekTimerMatchesPicture();
-                } finally {
-                    onMain(() -> {
-                        View root = (View) field("playerRoot");
-                        dispatchTouch(root, down.get(), SystemClock.uptimeMillis(), MotionEvent.ACTION_UP,
-                                root.getWidth() * .5f, root.getHeight() * .45f);
-                    });
-                }
-                awaitSeekPosition(targetPosition.get());
+                Thread.sleep(2500);
+                checkScrubDirection(mode, 1);
+                awaitMovingVideo();
+                checkScrubDirection(mode, -1);
                 awaitMovingVideo();
             }
             savePlayerScreenshot("continuous-seek");
@@ -400,6 +351,90 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             onMain(() -> invoke(open, originalVideo, 6000));
             awaitPlayerPrepared();
         }
+    }
+
+    private void checkScrubDirection(int mode, int direction) throws Exception {
+        AtomicReference<Long> down = new AtomicReference<>();
+        AtomicReference<Integer> targetPosition = new AtomicReference<>();
+        AtomicReference<Integer> initialVolume = new AtomicReference<>();
+        AtomicReference<Long> originalPlaybackTime = new AtomicReference<>();
+        java.util.HashSet<Integer> pictures = new java.util.HashSet<>();
+        int previewUpdates = 0;
+        int lastPreview = -1;
+        long lastPreviewAt = SystemClock.uptimeMillis();
+        long longestPreviewGap = 0;
+        float startX = direction > 0 ? .12f : .85f;
+        onMain(() -> {
+            org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+            initialVolume.set(player.getVolume());
+            originalPlaybackTime.set(player.getTime());
+            require(player.getAudioTrack() >= 0, "Scrub fixture has no audio track");
+            require(((ScrubPreview) field("scrubPreview")).isReady(), "Persistent scrub decoder did not prepare");
+            call("setControlsVisible", new Class<?>[] {boolean.class}, false);
+            View root = (View) field("playerRoot");
+            down.set(SystemClock.uptimeMillis());
+            dispatchTouch(root, down.get(), down.get(), MotionEvent.ACTION_DOWN,
+                    root.getWidth() * startX, root.getHeight() * .45f);
+        });
+        try {
+            for (int step = 1; step <= 48; step++) {
+                final float fraction = startX + direction * .38f * step / 48f;
+                onMain(() -> {
+                    View root = (View) field("playerRoot");
+                    dispatchTouch(root, down.get(), SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE,
+                            root.getWidth() * fraction, root.getHeight() * .45f);
+                });
+                Thread.sleep(20);
+                AtomicReference<Integer> preview = new AtomicReference<>();
+                onMain(() -> preview.set((Integer) field("displayedSeekPositionMs")));
+                if (preview.get() != lastPreview) {
+                    long now = SystemClock.uptimeMillis();
+                    if (lastPreview >= 0) longestPreviewGap = Math.max(longestPreviewGap, now - lastPreviewAt);
+                    lastPreviewAt = now;
+                    lastPreview = preview.get();
+                    previewUpdates++;
+                }
+                pictures.add(videoFrameSignature());
+                if (step % 12 == 0) {
+                    requireSeekTimerMatchesPicture();
+                    onMain(() -> {
+                        org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+                        require(Boolean.TRUE.equals(field("separateScrub")), "Scrubbing fell back to decoder resets");
+                        require(Boolean.TRUE.equals(field("playWhenReady")) && player.isPlaying(), "Scrubbing paused playback");
+                        require(player.getVolume() == initialVolume.get(), "Scrubbing changed audio volume");
+                        long elapsed = SystemClock.uptimeMillis() - down.get();
+                        long playbackTime = player.getTime();
+                        require(Math.abs(playbackTime - originalPlaybackTime.get() - elapsed) < 1500,
+                                "Playback clock jumped during drag: start=" + originalPlaybackTime.get()
+                                        + ", current=" + playbackTime + ", elapsed=" + elapsed);
+                    });
+                }
+            }
+            String label = "Mode" + mode + (direction > 0 ? "Forward" : "Backward");
+            Bundle metrics = new Bundle();
+            metrics.putInt("scrubUpdates" + label, previewUpdates);
+            metrics.putInt("scrubDistinctPictures" + label, pictures.size());
+            metrics.putLong("scrubLongestGapMs" + label, longestPreviewGap);
+            sendStatus(0, metrics);
+            require(previewUpdates >= 24 && pictures.size() >= 24, "Too few scrub pictures in " + label);
+            require(longestPreviewGap <= 180, "Scrub picture froze for " + longestPreviewGap + " ms in " + label);
+            onMain(() -> targetPosition.set((Integer) field("gestureTargetPosition")));
+            requireSeekTimerMatchesPicture();
+        } finally {
+            onMain(() -> {
+                View root = (View) field("playerRoot");
+                dispatchTouch(root, down.get(), SystemClock.uptimeMillis(), MotionEvent.ACTION_UP,
+                        root.getWidth() * (startX + direction * .38f), root.getHeight() * .45f);
+            });
+        }
+        awaitSeekPosition(targetPosition.get());
+        AtomicBoolean previewGone = new AtomicBoolean();
+        long deadline = SystemClock.uptimeMillis() + 2000;
+        while (!previewGone.get() && SystemClock.uptimeMillis() < deadline) {
+            onMain(() -> previewGone.set(((View) field("scrubView")).getAlpha() == 0f));
+            Thread.sleep(20);
+        }
+        require(previewGone.get(), "Scrub view did not hand off to full quality playback");
     }
 
     private void awaitSeekPosition(int expectedMs) throws Exception {
@@ -436,6 +471,13 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
         CountDownLatch ready = new CountDownLatch(1);
         AtomicReference<Integer> result = new AtomicReference<>();
         onMain(() -> {
+            android.view.TextureView preview = (android.view.TextureView) field("scrubView");
+            if (preview != null && preview.getAlpha() > .5f && preview.isAvailable()) {
+                preview.getBitmap(bitmap);
+                result.set(PixelCopy.SUCCESS);
+                ready.countDown();
+                return;
+            }
             SurfaceView surface = findSurface((View) field("videoLayout"));
             require(surface != null && surface.getHolder().getSurface().isValid(), "Video surface is not ready");
             PixelCopy.request(surface, bitmap, status -> { result.set(status); ready.countDown(); },
@@ -982,6 +1024,12 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             value.setAccessible(true);
             return value.get(activity);
         } catch (Exception failure) { throw new AssertionError(failure); }
+    }
+
+    private Object fieldOnMain(String name) {
+        AtomicReference<Object> value = new AtomicReference<>();
+        onMain(() -> value.set(field(name)));
+        return value.get();
     }
 
     private Object call(String name, Class<?>[] types, Object... args) {

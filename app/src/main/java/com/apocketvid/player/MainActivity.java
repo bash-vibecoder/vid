@@ -41,6 +41,7 @@ import android.view.MotionEvent;
 import android.view.MenuItem;
 import android.view.PixelCopy;
 import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
@@ -142,6 +143,9 @@ public final class MainActivity extends Activity {
 
     private FrameLayout playerRoot;
     private VLCVideoLayout videoLayout;
+    private TextureView scrubView;
+    private ScrubPreview scrubPreview;
+    private boolean separateScrub;
     private MediaPlayer mediaPlayer;
     private ImageButton playPauseButton;
     private ImageButton previousVideoButton;
@@ -216,6 +220,7 @@ public final class MainActivity extends Activity {
                 seekBar.setProgress((int) ((position * 1000L) / durationMs));
             }
             if (currentTimeText != null) currentTimeText.setText(formatTime(position));
+            if (scrubPreview != null && !scrubPreviewActive) scrubPreview.position(position, false);
             handler.postDelayed(this, 250);
         }
     };
@@ -244,7 +249,7 @@ public final class MainActivity extends Activity {
             boolean waitingForFrame = seekQueue.hasWork();
             SeekQueue.Request request = seekQueue.poll(now, frames, playWhenReady, frameTime);
             int renderedTarget = seekQueue.takeRenderedTarget();
-            if (scrubPreviewActive && (renderedTarget >= 0
+            if (!separateScrub && scrubPreviewActive && (renderedTarget >= 0
                     || (!waitingForFrame && frames > 0 && frames != lastSeekHudFrame))) {
                 showSeekHud((int) Math.max(0, frameTime));
                 lastSeekHudFrame = frames;
@@ -1371,6 +1376,11 @@ public final class MainActivity extends Activity {
         playerRoot.setBackgroundColor(Color.BLACK);
         videoLayout = new VLCVideoLayout(this);
         playerRoot.addView(videoLayout, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        scrubView = new TextureView(this);
+        scrubView.setOpaque(false);
+        scrubView.setAlpha(0f);
+        scrubView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        playerRoot.addView(scrubView, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         View gestureLayer = new View(this);
         playerRoot.addView(gestureLayer, new FrameLayout.LayoutParams(-1, -1));
 
@@ -1542,6 +1552,7 @@ public final class MainActivity extends Activity {
                         gestureStartPosition = safePosition();
                         gestureTargetPosition = gestureStartPosition;
                         seekQueue.beginGesture();
+                        separateScrub = scrubPreview != null && scrubPreview.isAvailable();
                         if (seekFrameMonitor != null) seekFrameMonitor.close();
                         seekFrameMonitor = new SeekFrameMonitor(handler);
                         scrubPreviewActive = true;
@@ -1566,7 +1577,8 @@ public final class MainActivity extends Activity {
                     gestureTargetPosition = clamp(gestureStartPosition
                             + SeekGesture.seekDeltaMs(dx, Math.max(1, viewWidth(videoLayout))), 0, durationMs);
                     int previewPosition = Math.min(gestureTargetPosition, Math.max(0, durationMs - 100));
-                    if (seekQueue.requestPreview(previewPosition)) scheduleSeekRequests();
+                    if (separateScrub && scrubPreview != null) scrubPreview.position(previewPosition, true);
+                    else if (seekQueue.requestPreview(previewPosition)) scheduleSeekRequests();
                 }
                 return true;
             }
@@ -1653,6 +1665,17 @@ public final class MainActivity extends Activity {
             player.attachViews(owner, null, true, false);
             player.setVideoScale(MediaPlayer.ScaleType.SURFACE_BEST_FIT);
             player.setEventListener(event -> handlePlayerEvent(player, event));
+            if (scrubPreview != null) scrubPreview.close();
+            scrubPreview = new ScrubPreview(this, scrubView, item.uri, pendingSeekMs, new ScrubPreview.Listener() {
+                @Override public void onFrame(int positionMs) {
+                    if (mediaPlayer == player && separateScrub && activeGesture == GESTURE_SEEK) showSeekHud(positionMs);
+                }
+                @Override public void onFailure() {
+                    if (mediaPlayer != player) return;
+                    separateScrub = false;
+                    if (activeGesture == GESTURE_SEEK && seekQueue.requestPreview(gestureTargetPosition)) scheduleSeekRequests();
+                }
+            });
 
             Media media = new Media(engine, currentVideoFd);
             try {
@@ -1732,6 +1755,8 @@ public final class MainActivity extends Activity {
                 handler.removeCallbacks(processSeekRequests);
                 seekQueue.clear();
                 seekQueueScheduled = false;
+                if (scrubPreview != null) scrubPreview.hide();
+                separateScrub = false;
                 if (seekFrameMonitor != null) seekFrameMonitor.close();
                 seekFrameMonitor = null;
                 scrubPreviewActive = false;
@@ -1803,6 +1828,9 @@ public final class MainActivity extends Activity {
         handler.removeCallbacks(processSeekRequests);
         seekQueue.clear();
         seekQueueScheduled = false;
+        if (scrubPreview != null) scrubPreview.close();
+        scrubPreview = null;
+        separateScrub = false;
         if (seekFrameMonitor != null) seekFrameMonitor.close();
         seekFrameMonitor = null;
         scrubPreviewActive = false;
@@ -2525,6 +2553,7 @@ public final class MainActivity extends Activity {
     private void setTouchLocked(boolean locked) {
         touchLocked = locked;
         seekQueue.cancelPreviews();
+        if (separateScrub && scrubPreview != null) scrubPreview.position(displayedSeekPositionMs, false);
         if (scrubPreviewActive) seekTo(displayedSeekPositionMs);
         activeGesture = GESTURE_NONE;
         seeking = false;
@@ -2546,6 +2575,7 @@ public final class MainActivity extends Activity {
     }
 
     private int safePosition() {
+        if (separateScrub && activeGesture == GESTURE_SEEK) return displayedSeekPositionMs;
         int committedTarget = seekQueue.committedTarget();
         if (committedTarget >= 0) return committedTarget;
         if (mediaPlayer == null || !mediaPrepared) return Math.max(0, savedPositionMs);
@@ -2665,6 +2695,8 @@ public final class MainActivity extends Activity {
 
     private void finishScrubPreview() {
         scrubPreviewActive = false;
+        if (scrubPreview != null) scrubPreview.hide();
+        separateScrub = false;
         if (seekFrameMonitor != null) seekFrameMonitor.close();
         seekFrameMonitor = null;
         seekQueue.endGesture();
@@ -2676,6 +2708,7 @@ public final class MainActivity extends Activity {
 
     private void finishPlayerGesture(boolean commitSeek) {
         if (activeGesture == GESTURE_SEEK) {
+            if (separateScrub && scrubPreview != null) scrubPreview.position(gestureTargetPosition, false);
             // Commit precisely once; a cancelled drag returns to its original position.
             seekTo(commitSeek ? gestureTargetPosition : gestureStartPosition);
             seeking = false;

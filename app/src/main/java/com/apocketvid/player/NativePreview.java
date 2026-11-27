@@ -31,5 +31,6 @@ final class NativePreview {
     }
 
     private static native byte[] readFrame(int fd, long offset, long length, long timeUs, int maxEdge, int[] dimensions);
+    static void ensureLoaded() {}
     private NativePreview() {}
 }

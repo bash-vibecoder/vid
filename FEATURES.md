@@ -22,7 +22,7 @@ The launcher icon uses a solid black background with a blue V. Adaptive and roun
 | --- | --- |
 | Show or hide playback controls | Tap the video once |
 | Seek backward or forward | Swipe horizontally; the first fifth of the screen moves five seconds, then a continued swipe moves ten seconds per fifth |
-| Seek without opening the full interface | Swipe through accurate frames while video and audio keep playing; the timer follows rendered pictures |
+| Seek without opening the full interface | Swipe through cached video previews; the timer follows the displayed frame and playback seeks on release |
 | Skip ten seconds | Double-tap the left or right side |
 | Play or pause | Use the bottom center button, or double-tap the center of the video |
 | Adjust brightness | Swipe vertically on the left |
@@ -37,6 +37,8 @@ The launcher icon uses a solid black background with a blue V. Adaptive and roun
 | Unlock playback touches | Tap the bottom-left lock while locked |
 
 Portrait and landscape videos are detected automatically. Controls stay visible when paused. When the app leaves the foreground, it saves the current position; returning recreates the video output and restores playback state.
+
+While seeking, previews use a lower resolution of at most 384 pixels per edge. Audio continues from the original playback timeline during the drag; releasing seeks video and audio to the chosen position and restores full quality video. The player does not automatically pause or mute. Moving beyond the cached frames or seeking through demanding files can still take time.
 
 Touch lock hides the playback controls and prevents taps, double taps, swipes, or Back from operating them. Only the bottom-left unlock button accepts player touches while locked. The lock stays in that corner, remains active after background recovery and when the player advances to another video, and clears when returning to the library.
 

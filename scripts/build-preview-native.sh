@@ -39,11 +39,11 @@ PYBUILD
 PREVIEW_FLAGS=(-I.local/native-preview/include -O2 -fPIC -fvisibility=hidden -fstack-protector-strong
     -D_FORTIFY_SOURCE=2 -Wall -Wextra -Werror -shared
     -Wl,-z,relro,-z,now,-z,noexecstack,-z,max-page-size=16384,--no-undefined,-soname,libapocketvid_preview.so
-    -L.local/native-preview/lib native/preview/preview.c -lavformat -lavcodec -lswscale -lavutil)
+    -L.local/native-preview/lib native/preview/preview.c native/preview/scrub.c -lavformat -lavcodec -lswscale -lavutil)
 if [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
     PREVIEW_COMPILER="$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -path '*/bin/aarch64-linux-android26-clang' -print -quit)"
     test -n "$PREVIEW_COMPILER"
-    "$PREVIEW_COMPILER" "${PREVIEW_FLAGS[@]}" -lm -o app/src/main/jniLibs/arm64-v8a/libapocketvid_preview.so
+    "$PREVIEW_COMPILER" "${PREVIEW_FLAGS[@]}" -landroid -lm -o app/src/main/jniLibs/arm64-v8a/libapocketvid_preview.so
 else
     # ARM64 Ubuntu chroot: use its clang with the existing Android/Termux headers and Bionic.
     PREVIEW_ANDROID_ROOT=/proc/1/root
@@ -53,7 +53,8 @@ else
     clang --target=aarch64-linux-android26 -fuse-ld=lld --sysroot="$PREVIEW_SYSROOT" \
         -isystem "$PREVIEW_SYSROOT/include" -isystem "$PREVIEW_SYSROOT/include/aarch64-linux-android" \
         -isystem "$PREVIEW_JDK/include" -isystem "$PREVIEW_JDK/include/linux" -nostdlib \
-        "${PREVIEW_FLAGS[@]}" "$PREVIEW_ANDROID_ROOT/apex/com.android.runtime/lib64/bionic/libc.so" \
+        "${PREVIEW_FLAGS[@]}" "$PREVIEW_ANDROID_ROOT/system/lib64/libandroid.so" \
+        "$PREVIEW_ANDROID_ROOT/apex/com.android.runtime/lib64/bionic/libc.so" \
         "$PREVIEW_ANDROID_ROOT/apex/com.android.runtime/lib64/bionic/libm.so" \
         -o app/src/main/jniLibs/arm64-v8a/libapocketvid_preview.so
 fi

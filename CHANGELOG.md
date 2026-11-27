@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.4.12 — 2026-11-27
+
+### Changed
+
+- Use a persistent FFmpeg scrub decoder and cached frames during horizontal drags, avoiding repeated resets in the main playback decoder in SW, HW, and HW+ modes.
+- Keep video and audio playing underneath the previews. Audio follows the original playback timeline during a drag; one precise seek on release moves video and audio to the chosen position, then full quality video replaces the preview.
+- Show the decoded preview's timestamp in the seek indicator. Preview frames use at most 384 pixels per edge and a separate 96 MB memory cache. Uncached positions and demanding files can still take time to decode.
+- Isolate scrub decoding in its own private process with deadlines and a watchdog. Preserve the subtitle list's Off-first behavior from 1.4.11.
+
+### Tests
+
+- Check immediate seeking before cache warmup, forward and backward drags in all three decoder modes, actual picture updates and their longest gaps, picture/timer alignment, and the transition back to full quality video after release.
+- Verify that dragging keeps native playback advancing without repeated seeks, pauses, or changes to audio volume.
+
+### Validation
+
+- All 37 unit tests and 21 device checks passed; lint reported no errors.
+- The 720p fixture produced 33–44 distinct pictures across 48 drag samples in both directions across SW, HW, and HW+, with longest measured update gaps of 58–95 milliseconds. An immediate drag before cache warmup produced 41 distinct pictures with a 70-millisecond longest gap. These measurements do not guarantee the same performance for other files.
+- Signed APK verification, 16 KB zip alignment, and offline permission checks passed. Installed the production package as 1.4.12 (18) and verified that its APK matches the file in `dist`.
+
 ## 1.4.11 — 2026-11-27
 
 ### Fixed
