@@ -1,5 +1,99 @@
 # Changelog
 
+## 1.4.11 — 2026-11-27
+
+### Fixed
+
+- Open the subtitle list at Off even when an active track is far down a long list. Set its checked radio separately so Android cannot scroll the dialog to that track while opening it.
+- Check the displayed video surface during swipe seeking instead of waiting for VLC's 250-millisecond statistics updates. Keep only the newest pending target and wait for pictures to continue at the requested time before sending another seek.
+- Sample the playback clock with each picture check and process seek requests every 16 milliseconds. Playback and audio volume remain active throughout the gesture.
+
+### Tests
+
+- Exercise sixteen embedded subtitle tracks, select the last one, reopen the menu three times, and verify that Off stays visible and disables the active subtitles.
+- Measure rendered seek updates and their longest gap in SW and HW+, compare the picture's embedded timestamp with the timer, and verify that native playback and volume remain enabled.
+
+### Validation
+
+- All 37 unit tests and 21 device checks passed; lint reported no errors.
+- The continuous seek fixture produced 12 visible timer updates in SW and 9 in HW+, with longest gaps of 238 and 295 milliseconds. The earlier SW run produced 7 updates with a 438-millisecond gap and failed picture/timer alignment.
+
+## 1.4.10 — 2026-11-27
+
+### Changed
+
+- Center Previous, Play/Pause, and Next inside their full-width rectangles. Keep the separate lock in its bottom-left corner.
+- Keep video and audio playing during live scrubbing, with accurate decoded frames and no automatic pause or mute.
+- Update the seek timer when a new picture is rendered, keeping it aligned with the displayed frame.
+- Reduce the render wait from 350 to 64 milliseconds and poll at 24-millisecond intervals while seeking. Reuse an accurate preview on release and discard duplicate seek requests.
+
+### Tests
+
+- Add a machine-readable clock to the seek fixture and compare its decoded picture time with the on-screen timer in software and HW+ modes.
+- Check centered icon geometry, unchanged playback intent and audio volume during scrubbing, quick frame acknowledgement, and release without redundant decoding.
+
+## 1.4.9 — 2026-11-27
+
+### Fixed
+
+- Extend the transport rectangles across nearly the entire bottom bar beside the reserved lock corner, with small gaps and icons positioned toward the center.
+- Wait for rendered video frames before sending the next swipe preview, keeping only the latest target and committing the released position once.
+- Suspend preview retries when a decoder falls behind. If a committed seek stops producing pictures, reopen once at the requested position with the play state, speed, and controls preserved.
+- Keep the displayed seek position stable while the decoder catches up.
+
+### Tests
+
+- Add seek queue tests for continuous input, final seek ordering, decoder stalls, paused playback, and cancellation.
+- Add continuous forward-swipe checks using a 720p H.264 video with ten-second keyframe intervals in software and HW+ modes. The checks compare actual decoded pictures during the swipe and after release.
+
+### Validation
+
+- Twenty-nine unit tests and eighteen on-device checks passed. Continuous forward seeking rendered moving pictures during the drag and after release in software and HW+, without triggering decoder recovery. Lint reported no errors.
+- Signed APK, 16 KB alignment, and offline permission checks passed.
+
+## 1.4.8 — 2026-11-27
+
+### Fixed
+
+- Show the bottom-left lock only while the playback controls overlay is visible; keep unlock available while locked.
+- Center a wider transport group with larger icons and taller blue outlined rectangles, separated by small gaps.
+- Preview video while swipe seeking, with throttled fast seeks during the drag and one precise seek on release.
+- Extend the volume swipe to 200%, using player audio gain above the Android stream's 100% limit in SW, HW, and HW+ modes.
+- Keep Off first in the subtitle list while marking the actual active track, and verify that selecting Off stops subtitles.
+- Show transparent audio/subtitle panels at the right edge without dimming the video, including audio boost and sync controls.
+- Replace the audio sync slider with a signed editable seconds value and −/+ buttons for 0.1-second steps. Typed values retain millisecond precision.
+
+### Validation
+
+- Nineteen unit tests and seventeen on-device checks passed, covering live swipe seeking, native 200% gain in HW+, subtitle selection and Off, transparent right-side panels, typed audio offsets and reset, enlarged transport controls, touch lock, and background recovery. Lint reported no errors.
+- Signed APK verification, 16 KB alignment, and the offline permission check passed.
+
+## 1.4.7 — 2026-11-26
+
+### Added
+
+- Add HW+ alongside software and hardware decoder modes.
+- Add external audio track loading, per-video audio sync correction, and 100–200% audio boost.
+- Open the subtitle selection list with Off selected every time.
+
+### Changed
+
+- Keep the lock/unlock control fixed at the bottom-left corner, separate from the transport buttons.
+- Spread Previous, Play/Pause, and Next across the bottom bar with rectangular buttons and thin blue borders.
+
+## 1.4.6 — 2026-11-25
+
+### Added
+
+- Add persistent software/hardware video decoding selection to the player. Changing modes reopens the current video at its current position and restores its play/pause state and speed.
+- Move playback touch lock into the bottom bar and center Previous, Play/Pause, Next, and Lock with moderate spacing.
+- Accelerate horizontal seeking during a continued drag: the first screen fifth seeks five seconds, and each additional fifth seeks ten seconds.
+
+### Validation
+
+- Unit tests cover the initial seek rate, continued-drag acceleration, reverse seeking, and invalid screen widths.
+- Updated device smoke checks to locate and operate the lock control in the bottom bar.
+
 ## 1.4.5 — 2026-11-17
 
 ### Changed

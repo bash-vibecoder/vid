@@ -17,6 +17,7 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
@@ -26,9 +27,13 @@ import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
+import android.text.Editable;
+import android.text.InputType;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.view.GestureDetector;
 import android.view.Gravity;
@@ -38,9 +43,12 @@ import android.view.PixelCopy;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
+import android.view.inputmethod.EditorInfo;
+import android.widget.ArrayAdapter;
 import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -86,6 +94,10 @@ public final class MainActivity extends Activity {
     private static final int LINE = Color.rgb(33, 46, 63);
     private static final int PERMISSION_REQUEST = 52;
     private static final int SUBTITLE_FILE_REQUEST = 53;
+    private static final int AUDIO_FILE_REQUEST = 54;
+    private static final int DECODER_SOFTWARE = 0;
+    private static final int DECODER_HARDWARE = 1;
+    private static final int DECODER_HARDWARE_PLUS = 2;
     private static final int SORT_NAME = 0;
     private static final int SORT_NEWEST = 1;
     private static final int SORT_OLDEST = 2;
@@ -95,7 +107,6 @@ public final class MainActivity extends Activity {
     private static final int GESTURE_BRIGHTNESS = 1;
     private static final int GESTURE_VOLUME = 2;
     private static final int GESTURE_SEEK = 3;
-    private static final int SEEK_MS_PER_SCREEN_WIDTH = 25000;
 
     private final ArrayList<VideoItem> videos = new ArrayList<>();
     private final ArrayList<VideoItem> visibleVideos = new ArrayList<>();
@@ -140,9 +151,11 @@ public final class MainActivity extends Activity {
     private TextView durationText;
     private TextView playerTitle;
     private TextView speedButton;
+    private TextView decoderButton;
     private TextView audioButton;
     private TextView subtitleButton;
     private TextView adjustmentHud;
+    private ImageButton lockButton;
     private View loadingPanel;
     private TextView loadingMessage;
     private View controlsTop;
@@ -150,6 +163,8 @@ public final class MainActivity extends Activity {
     private FrameLayout touchLockOverlay;
     private ImageButton unlockButton;
     private boolean touchLocked;
+    private int decoderMode;
+    private int audioBoostPercent = 100;
     private VideoItem currentVideo;
     private int currentIndex = -1;
     private int durationMs;
@@ -163,6 +178,12 @@ public final class MainActivity extends Activity {
     private int gestureStartVolume;
     private int gestureTargetPosition;
     private int gestureStartPosition;
+    private final SeekQueue seekQueue = new SeekQueue();
+    private SeekFrameMonitor seekFrameMonitor;
+    private boolean seekQueueScheduled;
+    private boolean scrubPreviewActive;
+    private int displayedSeekPositionMs;
+    private int lastSeekHudFrame = -1;
     private float gestureStartBrightness;
     private float originalScreenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE;
     private float speed = 1.0f;
@@ -177,12 +198,13 @@ public final class MainActivity extends Activity {
     private boolean searchVisible;
     private boolean brightnessChanged;
     private AudioManager audioManager;
-    private boolean subtitlePickerActive;
-    private String subtitlePickerVideoUri;
+    private boolean mediaPickerActive;
+    private String pickedTrackVideoUri;
     private AssetFileDescriptor currentVideoFd;
-    private final ArrayList<File> importedSubtitleFiles = new ArrayList<>();
+    private final ArrayList<File> importedTrackFiles = new ArrayList<>();
     private boolean externalSubtitleAttached;
     private int subtitleLoadGeneration;
+    private int audioLoadGeneration;
 
     private final Runnable progressTick = new Runnable() {
         @Override public void run() {
@@ -204,6 +226,47 @@ public final class MainActivity extends Activity {
         }
     };
 
+    private final Runnable processSeekRequests = new Runnable() {
+        @Override public void run() {
+            seekQueueScheduled = false;
+            MediaPlayer player = mediaPlayer;
+            if (player == null || !mediaPrepared || playerRoot == null) {
+                seekQueue.clear();
+                return;
+            }
+            long now = SystemClock.uptimeMillis();
+            int frames = displayedVideoFrames(player);
+            long frameTime = player.getTime();
+            if (seekFrameMonitor != null) {
+                frames = seekFrameMonitor.sample(findVideoSurface(videoLayout), frames, frameTime);
+                if (seekFrameMonitor.pictureTimeMs() >= 0) frameTime = seekFrameMonitor.pictureTimeMs();
+            }
+            boolean waitingForFrame = seekQueue.hasWork();
+            SeekQueue.Request request = seekQueue.poll(now, frames, playWhenReady, frameTime);
+            int renderedTarget = seekQueue.takeRenderedTarget();
+            if (scrubPreviewActive && (renderedTarget >= 0
+                    || (!waitingForFrame && frames > 0 && frames != lastSeekHudFrame))) {
+                showSeekHud((int) Math.max(0, frameTime));
+                lastSeekHudFrame = frames;
+            }
+            if (request != null) {
+                savedPositionMs = request.positionMs;
+                // Decode the requested frame accurately, including its reference frames.
+                player.setTime(request.positionMs, false);
+            }
+            int recoveryTarget = seekQueue.takeRecoveryTarget();
+            if (recoveryTarget >= 0) {
+                Log.w("APocketVid", "Decoder stopped rendering after seek; reopening at " + recoveryTarget);
+                reopenAfterStalledSeek(recoveryTarget);
+                return;
+            }
+            if (seekQueue.hasWork() || (scrubPreviewActive && activeGesture == GESTURE_SEEK)) {
+                seekQueueScheduled = true;
+                handler.postDelayed(this, 16);
+            } else if (scrubPreviewActive) finishScrubPreview();
+        }
+    };
+
     private final Runnable hideAdjustmentHud = new Runnable() {
         @Override public void run() {
             if (adjustmentHud != null) adjustmentHud.setVisibility(View.GONE);
@@ -221,6 +284,9 @@ public final class MainActivity extends Activity {
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
         preferences = getSharedPreferences("player", MODE_PRIVATE);
+        decoderMode = clamp(preferences.getInt("decoderMode", preferences.getBoolean("hardwareDecoding", false)
+                ? DECODER_HARDWARE : DECODER_SOFTWARE), DECODER_SOFTWARE, DECODER_HARDWARE_PLUS);
+        audioBoostPercent = clamp(preferences.getInt("audioBoostPercent", 100), 100, 200);
         previewLoader = new VideoPreviewLoader(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         sortMode = preferences.getInt("sortMode", SORT_NAME);
@@ -297,13 +363,13 @@ public final class MainActivity extends Activity {
         activityVisible = false;
         previewLoader.setPlaybackActive(true);
         if (currentVideo != null && mediaPrepared) persistResumePosition();
-        if (!subtitlePickerActive && playerRoot != null && playWhenReady) {
+        if (!mediaPickerActive && playerRoot != null && playWhenReady) {
             savedPositionMs = safePosition();
             playWhenReady = false;
             if (mediaPlayer != null && mediaPrepared && mediaPlayer.isPlaying()) mediaPlayer.pause();
             pausedForBackground = true;
         }
-        if (!subtitlePickerActive && playerRoot != null && currentVideo != null) {
+        if (!mediaPickerActive && playerRoot != null && currentVideo != null) {
             // A destroyed SurfaceView invalidates VLC's decoder output. Reopen the input on
             // return, using the existing engine and saved state, instead of reviving that output.
             if (mediaPrepared) savedPositionMs = safePosition();
@@ -604,6 +670,7 @@ public final class MainActivity extends Activity {
         touchLocked = false;
         touchLockOverlay = null;
         unlockButton = null;
+        lockButton = null;
         playerRoot = null;
         releaseMediaPlayer();
         previewLoader.setPlaybackActive(!activityVisible);
@@ -682,10 +749,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != SUBTITLE_FILE_REQUEST) return;
-        subtitlePickerActive = false;
-        String pickedForVideo = subtitlePickerVideoUri;
-        subtitlePickerVideoUri = null;
+        if (requestCode != SUBTITLE_FILE_REQUEST && requestCode != AUDIO_FILE_REQUEST) return;
+        mediaPickerActive = false;
+        String pickedForVideo = pickedTrackVideoUri;
+        pickedTrackVideoUri = null;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
         Uri uri = data.getData();
         if ((data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
@@ -694,7 +761,8 @@ public final class MainActivity extends Activity {
             } catch (RuntimeException ignored) {}
         }
         if (currentVideo != null && currentVideo.uri.toString().equals(pickedForVideo)) {
-            loadExternalSubtitle(uri, currentVideo, true);
+            if (requestCode == SUBTITLE_FILE_REQUEST) loadExternalSubtitle(uri, currentVideo, true);
+            else loadExternalAudio(uri, currentVideo, true);
         }
     }
 
@@ -1330,8 +1398,6 @@ public final class MainActivity extends Activity {
         LinearLayout heading = horizontal();
         LinearLayout trackControls = horizontal();
         heading.addView(iconButton(android.R.drawable.ic_menu_close_clear_cancel, "Back to videos", true, v -> showLibrary()));
-        ImageButton lock = iconButton(R.drawable.ic_lock, "Lock playback touches", true, v -> setTouchLocked(true));
-        heading.addView(lock, new LinearLayout.LayoutParams(dp(48), dp(48)));
         playerTitle = text(currentVideo.title, 15, Color.WHITE, true);
         playerTitle.setSingleLine(true);
         playerTitle.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
@@ -1351,6 +1417,9 @@ public final class MainActivity extends Activity {
                 ColorStateList.valueOf(0x44ffffff), rounded(Color.TRANSPARENT, 5), null));
         speedButton.setOnClickListener(v -> cycleSpeed());
         trackControls.addView(speedButton, new LinearLayout.LayoutParams(-2, dp(44)));
+        decoderButton = playerTextButton("", "Select video decoding mode", v -> showDecoderSelection());
+        trackControls.addView(decoderButton, new LinearLayout.LayoutParams(dp(48), dp(44)));
+        updateDecoderButton();
         top.addView(heading, new LinearLayout.LayoutParams(-1, dp(48)));
         LinearLayout.LayoutParams trackParams = new LinearLayout.LayoutParams(-2, dp(44));
         trackParams.gravity = Gravity.END;
@@ -1364,7 +1433,7 @@ public final class MainActivity extends Activity {
         });
 
         LinearLayout bottom = vertical();
-        bottom.setPadding(dp(16), dp(2), dp(16), dp(2));
+        bottom.setPadding(dp(8), dp(2), dp(8), dp(2));
         bottom.setBackground(glassBackground(0));
         controlsBottom = bottom;
         FrameLayout.LayoutParams bottomParams = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
@@ -1405,20 +1474,29 @@ public final class MainActivity extends Activity {
             }
         });
 
+        FrameLayout playbackRow = new FrameLayout(this);
+        playbackRow.setPadding(dp(64), 0, dp(8), 0);
+        bottom.addView(playbackRow, new LinearLayout.LayoutParams(-1, dp(64)));
         LinearLayout playback = horizontal();
         playback.setGravity(Gravity.CENTER);
-        playback.setPadding(dp(8), 0, dp(8), 0);
-        bottom.addView(playback, new LinearLayout.LayoutParams(-1, dp(48)));
+        playbackRow.addView(playback, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
         previousVideoButton = iconButton(R.drawable.ic_previous, "Previous video", true, v -> playAdjacent(-1));
         playPauseButton = iconButton(R.drawable.ic_pause, "Pause", true, v -> togglePlayback());
         playPauseButton.setPadding(dp(10), dp(10), dp(10), dp(10));
         nextVideoButton = iconButton(R.drawable.ic_next, "Next video", true, v -> playAdjacent(1));
-        addTransportButton(playback, previousVideoButton, 48);
-        addTransportDivider(playback);
-        addTransportButton(playback, playPauseButton, 48);
-        addTransportDivider(playback);
-        addTransportButton(playback, nextVideoButton, 48);
+        for (ImageButton button : new ImageButton[] {previousVideoButton, playPauseButton, nextVideoButton}) {
+            button.setBackground(transportButtonBackground());
+            button.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        }
+        addTransportButton(playback, previousVideoButton, 56);
+        addTransportButton(playback, playPauseButton, 56);
+        addTransportButton(playback, nextVideoButton, 56);
         updateTransportButtons();
+
+        lockButton = iconButton(R.drawable.ic_lock, "Lock playback touches", true, v -> setTouchLocked(true));
+        FrameLayout.LayoutParams lockParams = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.BOTTOM | Gravity.LEFT);
+        lockParams.setMargins(dp(12), 0, 0, dp(10));
+        playerRoot.addView(lockButton, lockParams);
 
         GestureDetector gestures = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override public boolean onDown(MotionEvent event) { return true; }
@@ -1454,15 +1532,22 @@ public final class MainActivity extends Activity {
                             gestureStartBrightness = currentBrightness();
                         } else if (start.getX() > viewWidth(videoLayout) * 0.56f) {
                             activeGesture = GESTURE_VOLUME;
-                            gestureStartVolume = audioManager == null ? 0
-                                    : audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+                            gestureStartVolume = currentVolumePercent();
                         } else {
                             return false;
                         }
                     } else {
-                        if (!mediaPrepared || durationMs <= 0) return false;
+                        if (!mediaPrepared || durationMs <= 0 || mediaPlayer == null || !mediaPlayer.isSeekable()) return false;
                         activeGesture = GESTURE_SEEK;
                         gestureStartPosition = safePosition();
+                        gestureTargetPosition = gestureStartPosition;
+                        seekQueue.beginGesture();
+                        if (seekFrameMonitor != null) seekFrameMonitor.close();
+                        seekFrameMonitor = new SeekFrameMonitor(handler);
+                        scrubPreviewActive = true;
+                        lastSeekHudFrame = -1;
+                        showSeekHud(gestureStartPosition);
+                        seeking = true;
                         setControlsVisible(false);
                         handler.removeCallbacks(hideControls);
                     }
@@ -1473,16 +1558,15 @@ public final class MainActivity extends Activity {
                     setWindowBrightness(brightness);
                     showAdjustmentHud("Brightness  " + Math.round(brightness * 100) + "%");
                 } else if (activeGesture == GESTURE_VOLUME && audioManager != null) {
-                    int maximum = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-                    int volume = clamp(gestureStartVolume + Math.round(dy / (float) Math.max(1, viewHeight(videoLayout)) * maximum), 0, maximum);
-                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, volume, 0);
-                    int percent = maximum == 0 ? 0 : Math.round(volume * 100f / maximum);
-                    showAdjustmentHud("Volume  " + percent + "%");
+                    int percent = clamp(gestureStartVolume
+                            + Math.round(dy / Math.max(1, viewHeight(videoLayout)) * 200), 0, 200);
+                    setGestureVolume(percent);
+                    showAdjustmentHud("Volume  " + percent + "%" + (percent > 100 ? "  Boost" : ""));
                 } else if (activeGesture == GESTURE_SEEK) {
                     gestureTargetPosition = clamp(gestureStartPosition
-                            + Math.round(dx / (float) Math.max(1, viewWidth(videoLayout)) * SEEK_MS_PER_SCREEN_WIDTH),
-                            0, durationMs);
-                    showAdjustmentHud(formatTime(gestureTargetPosition) + " / " + formatTime(durationMs));
+                            + SeekGesture.seekDeltaMs(dx, Math.max(1, viewWidth(videoLayout))), 0, durationMs);
+                    int previewPosition = Math.min(gestureTargetPosition, Math.max(0, durationMs - 100));
+                    if (seekQueue.requestPreview(previewPosition)) scheduleSeekRequests();
                 }
                 return true;
             }
@@ -1503,8 +1587,8 @@ public final class MainActivity extends Activity {
         unlockButton.setImageTintList(ColorStateList.valueOf(ACCENT));
         unlockButton.setBackground(new RippleDrawable(ColorStateList.valueOf(0x33ffffff),
                 rounded(0x99000000, 24), null));
-        FrameLayout.LayoutParams unlockParams = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.TOP | Gravity.LEFT);
-        unlockParams.setMargins(dp(12), dp(12), 0, 0);
+        FrameLayout.LayoutParams unlockParams = new FrameLayout.LayoutParams(dp(48), dp(48), Gravity.BOTTOM | Gravity.LEFT);
+        unlockParams.setMargins(dp(12), 0, 0, dp(10));
         touchLockOverlay.addView(unlockButton, unlockParams);
         setControlsVisible(controlsVisible);
         setContentView(playerRoot);
@@ -1572,11 +1656,12 @@ public final class MainActivity extends Activity {
 
             Media media = new Media(engine, currentVideoFd);
             try {
-                // With codec=all, VLC's priority-zero MediaCodec/OMX modules are never requested.
-                media.setHWDecoderEnabled(false, false);
-                media.addOption(":avcodec-hw=none");
+                // Per-media decoder options select hardware or software while retaining codec fallback.
                 media.addOption(":file-caching=" + PlaybackOptions.LOCAL_CACHE_MS);
                 media.addOption(":no-input-fast-seek");
+                boolean useHardware = decoderMode != DECODER_SOFTWARE;
+                media.setHWDecoderEnabled(useHardware, decoderMode == DECODER_HARDWARE_PLUS);
+                if (decoderMode == DECODER_HARDWARE_PLUS) media.addOption(":avcodec-hw=any");
                 if (pendingSeekMs > 0) {
                     media.addOption(String.format(Locale.US, ":start-time=%.3f", pendingSeekMs / 1000.0));
                 }
@@ -1613,7 +1698,10 @@ public final class MainActivity extends Activity {
                     pendingSeekMs = 0;
                     persistResumePosition();
                     if (speed != 1f) player.setRate(speed);
+                    player.setVolume(audioBoostPercent);
+                    player.setAudioDelay(preferences.getInt("audioDelayMs:" + currentVideo.uri, 0) * 1000L);
                     restoreTrackSelections(player);
+                    loadSavedExternalAudio();
                     loadSavedExternalSubtitle();
                     handler.removeCallbacks(progressTick);
                     handler.post(progressTick);
@@ -1641,6 +1729,12 @@ public final class MainActivity extends Activity {
                 updatePlaybackIcon();
                 break;
             case MediaPlayer.Event.EndReached:
+                handler.removeCallbacks(processSeekRequests);
+                seekQueue.clear();
+                seekQueueScheduled = false;
+                if (seekFrameMonitor != null) seekFrameMonitor.close();
+                seekFrameMonitor = null;
+                scrubPreviewActive = false;
                 playWhenReady = false;
                 clearResumePosition(currentVideo);
                 VideoItem next = adjacentVideo(1);
@@ -1706,7 +1800,16 @@ public final class MainActivity extends Activity {
     private void releaseMediaPlayer() {
         playerLoadGeneration++;
         handler.removeCallbacks(prepareTimeout);
+        handler.removeCallbacks(processSeekRequests);
+        seekQueue.clear();
+        seekQueueScheduled = false;
+        if (seekFrameMonitor != null) seekFrameMonitor.close();
+        seekFrameMonitor = null;
+        scrubPreviewActive = false;
+        activeGesture = GESTURE_NONE;
+        seeking = false;
         subtitleLoadGeneration++;
+        audioLoadGeneration++;
         externalSubtitleAttached = false;
         MediaPlayer player = mediaPlayer;
         mediaPlayer = null;
@@ -1717,9 +1820,9 @@ public final class MainActivity extends Activity {
         }
         AssetFileDescriptor descriptor = currentVideoFd;
         currentVideoFd = null;
-        ArrayList<File> subtitles = new ArrayList<>(importedSubtitleFiles);
-        importedSubtitleFiles.clear();
-        if (player != null || descriptor != null || !subtitles.isEmpty()) playerIo.execute(() -> {
+        ArrayList<File> importedFiles = new ArrayList<>(importedTrackFiles);
+        importedTrackFiles.clear();
+        if (player != null || descriptor != null || !importedFiles.isEmpty()) playerIo.execute(() -> {
             // Detach views on the main thread, then let native decoding stop off the UI thread.
             try {
                 if (player != null) {
@@ -1728,7 +1831,7 @@ public final class MainActivity extends Activity {
                 }
             } finally {
                 if (descriptor != null) try { descriptor.close(); } catch (IOException ignored) {}
-                for (File file : subtitles) file.delete();
+                for (File file : importedFiles) file.delete();
             }
         });
     }
@@ -1746,7 +1849,15 @@ public final class MainActivity extends Activity {
     private void addTransportButton(LinearLayout row, ImageButton button, int size) {
         FrameLayout slot = new FrameLayout(this);
         row.addView(slot, new LinearLayout.LayoutParams(0, -1, 1));
-        slot.addView(button, new FrameLayout.LayoutParams(dp(size), dp(size), Gravity.CENTER));
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(-1, dp(size), Gravity.CENTER);
+        params.setMargins(dp(2), 0, dp(2), 0);
+        slot.addView(button, params);
+    }
+
+    private RippleDrawable transportButtonBackground() {
+        GradientDrawable outline = rounded(0x221d3f61, 2);
+        outline.setStroke(dp(1), 0xaa268bff);
+        return new RippleDrawable(ColorStateList.valueOf(0x55388fff), outline, null);
     }
 
     private void addTransportDivider(LinearLayout row) {
@@ -1819,12 +1930,55 @@ public final class MainActivity extends Activity {
         return button;
     }
 
+    private void showDecoderSelection() {
+        PopupMenu menu = new PopupMenu(this, decoderButton);
+        menu.getMenu().setGroupCheckable(0, true, true);
+        menu.getMenu().add(0, DECODER_SOFTWARE, 0, "Software decoding")
+                .setCheckable(true).setChecked(decoderMode == DECODER_SOFTWARE);
+        menu.getMenu().add(0, DECODER_HARDWARE, 1, "Hardware decoding")
+                .setCheckable(true).setChecked(decoderMode == DECODER_HARDWARE);
+        menu.getMenu().add(0, DECODER_HARDWARE_PLUS, 2, "Hardware+ decoding")
+                .setCheckable(true).setChecked(decoderMode == DECODER_HARDWARE_PLUS);
+        menu.setOnMenuItemClickListener(item -> {
+            setDecoderMode(item.getItemId());
+            return true;
+        });
+        menu.show();
+    }
+
+    private void updateDecoderButton() {
+        if (decoderButton == null) return;
+        String label = decoderMode == DECODER_HARDWARE_PLUS ? "HW+"
+                : decoderMode == DECODER_HARDWARE ? "HW" : "SW";
+        decoderButton.setText(label);
+        decoderButton.setContentDescription("Video decoding: " + label);
+    }
+
+    private void setDecoderMode(int mode) {
+        mode = clamp(mode, DECODER_SOFTWARE, DECODER_HARDWARE_PLUS);
+        if (decoderMode == mode) return;
+        decoderMode = mode;
+        preferences.edit().putInt("decoderMode", mode)
+                .putBoolean("hardwareDecoding", mode != DECODER_SOFTWARE).apply();
+        updateDecoderButton();
+        if (currentVideo != null && playerRoot != null) {
+            int position = mediaPrepared ? safePosition() : savedPositionMs;
+            float previousSpeed = speed;
+            int previousSpeedIndex = speedIndex;
+            boolean shouldPlay = playWhenReady;
+            persistResumePosition();
+            openVideo(currentVideo, position);
+            speed = previousSpeed;
+            speedIndex = previousSpeedIndex;
+            playWhenReady = shouldPlay;
+            updateSpeedButton();
+        }
+    }
+
     private void updateTrackControls(MediaPlayer player) {
         if (audioButton == null || subtitleButton == null) return;
-        boolean hasAudio = selectableTracks(player, false).size() > 0;
-        audioButton.setEnabled(hasAudio);
-        audioButton.setAlpha(hasAudio ? 1.0f : 0.45f);
-        // The subtitle action remains available to import a file when no embedded subtitles exist.
+        audioButton.setEnabled(true);
+        audioButton.setAlpha(1.0f);
         subtitleButton.setEnabled(true);
         subtitleButton.setAlpha(1.0f);
     }
@@ -1887,24 +2041,14 @@ public final class MainActivity extends Activity {
         return name;
     }
 
-    private void showTrackSelection(boolean subtitles) {
+    private AlertDialog showTrackSelection(boolean subtitles) {
         if (!mediaPrepared || mediaPlayer == null || currentVideo == null) {
             Toast.makeText(this, "Player is still preparing", Toast.LENGTH_SHORT).show();
-            return;
+            return null;
         }
         MediaPlayer selectedPlayer = mediaPlayer;
         VideoItem selectedVideo = currentVideo;
         ArrayList<MediaPlayer.TrackDescription> tracks = selectableTracks(selectedPlayer, subtitles);
-        if (tracks.isEmpty()) {
-            AlertDialog.Builder dialog = new AlertDialog.Builder(this)
-                    .setTitle(subtitles ? "Subtitles" : "Audio")
-                    .setMessage(subtitles ? "No embedded subtitles found. Load a subtitle file from storage?"
-                            : "No audio tracks were found in this file.")
-                    .setNegativeButton("Close", null);
-            if (subtitles) dialog.setPositiveButton("Load from storage", (d, which) -> pickSubtitleFile());
-            dialog.show();
-            return;
-        }
         ArrayList<String> labels = new ArrayList<>();
         ArrayList<Integer> ids = new ArrayList<>();
         int selected = subtitles ? selectedPlayer.getSpuTrack() : selectedPlayer.getAudioTrack();
@@ -1912,7 +2056,7 @@ public final class MainActivity extends Activity {
         if (subtitles) {
             labels.add("Off");
             ids.add(-1);
-            if (selected < 0) checked = 0;
+            checked = selected < 0 ? 0 : -1;
         }
         for (int i = 0; i < tracks.size(); i++) {
             MediaPlayer.TrackDescription track = tracks.get(i);
@@ -1920,17 +2064,47 @@ public final class MainActivity extends Activity {
             ids.add(track.id);
             if (track.id == selected) checked = ids.size() - 1;
         }
-        if (subtitles) labels.add("Load from storage...");
-        new AlertDialog.Builder(this)
+        int loadFileChoice = ids.size();
+        labels.add(subtitles ? "Load subtitle from storage..." : "Load audio from storage...");
+        int syncChoice = -1;
+        int boostChoice = -1;
+        if (!subtitles) {
+            syncChoice = labels.size();
+            labels.add("Audio sync correction...");
+            boostChoice = labels.size();
+            labels.add("Audio boost...");
+        }
+        final int audioSyncChoice = syncChoice;
+        final int audioBoostChoice = boostChoice;
+        AlertDialog.Builder builder = new AlertDialog.Builder(this, R.style.PlayerPanelTheme);
+        ArrayAdapter<String> adapter = new ArrayAdapter<String>(builder.getContext(),
+                android.R.layout.simple_list_item_single_choice, labels) {
+            @Override public View getView(int position, View recycled, ViewGroup parent) {
+                TextView row = (TextView) super.getView(position, recycled, parent);
+                row.setTextColor(INK);
+                row.setShadowLayer(dp(2), 0, dp(1), Color.BLACK);
+                row.setBackgroundColor(Color.TRANSPARENT);
+                return row;
+            }
+        };
+        AlertDialog trackDialog = builder
                 .setTitle(subtitles ? "Subtitles" : "Audio track")
-                .setSingleChoiceItems(labels.toArray(new String[0]), checked, (dialog, choice) -> {
+                .setSingleChoiceItems(adapter, subtitles ? -1 : checked, (dialog, choice) -> {
                     if (mediaPlayer != selectedPlayer || currentVideo != selectedVideo) {
                         dialog.dismiss();
                         return;
                     }
                     dialog.dismiss();
-                    if (subtitles && choice == ids.size()) {
-                        pickSubtitleFile();
+                    if (choice == loadFileChoice) {
+                        if (subtitles) pickSubtitleFile(); else pickAudioFile();
+                        return;
+                    }
+                    if (choice == audioSyncChoice) {
+                        showAudioDelayDialog();
+                        return;
+                    }
+                    if (choice == audioBoostChoice) {
+                        showAudioBoostDialog();
                         return;
                     }
                     if (choice < 0 || choice >= ids.size()) return;
@@ -1947,25 +2121,244 @@ public final class MainActivity extends Activity {
                         edit.putInt("vlcSubtitleTrack:" + selectedVideo.uri, id)
                                 .remove("subtitleFileUri:" + selectedVideo.uri)
                                 .remove("subtitleFileName:" + selectedVideo.uri);
-                    } else edit.putInt("vlcAudioTrack:" + selectedVideo.uri, id);
+                    } else edit.putInt("vlcAudioTrack:" + selectedVideo.uri, id)
+                            .remove("audioFileUri:" + selectedVideo.uri)
+                            .remove("audioFileName:" + selectedVideo.uri);
                     edit.apply();
                 })
                 .setNegativeButton("Cancel", null)
-                .show();
+                .create();
+        showPlayerPanel(trackDialog);
+        if (subtitles) {
+            // Supplying checked to AlertController also scrolls to that track during layout.
+            // Mark the radio separately and position Off after the window has been sized.
+            ListView list = trackDialog.getListView();
+            if (checked >= 0) list.setItemChecked(checked, true);
+            list.setSelectionFromTop(0, 0);
+            list.post(() -> {
+                if (trackDialog.isShowing()) list.setSelectionFromTop(0, 0);
+            });
+        }
+        return trackDialog;
+    }
+
+    private void showPlayerPanel(AlertDialog dialog) {
+        dialog.setOnDismissListener(ignored -> applyImmersiveMode());
+        dialog.show();
+        Window window = dialog.getWindow();
+        if (window == null) return;
+        window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+        window.setDimAmount(0f);
+        window.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN
+                | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        View decor = window.getDecorView();
+        decor.setPadding(0, 0, 0, 0);
+        decor.setSystemUiVisibility(getWindow().getDecorView().getSystemUiVisibility());
+        int availableWidth = playerRoot != null && playerRoot.getWidth() > 0
+                ? playerRoot.getWidth() : getResources().getDisplayMetrics().widthPixels;
+        window.setLayout(Math.min(dp(360), Math.round(availableWidth * .85f)), -2);
+        decor.post(() -> addPlayerPanelTextShadows(decor));
+    }
+
+    private void addPlayerPanelTextShadows(View view) {
+        if (view instanceof TextView) ((TextView) view).setShadowLayer(dp(2), 0, dp(1), Color.BLACK);
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) addPlayerPanelTextShadows(group.getChildAt(i));
+        }
+    }
+
+    private void showAudioBoostDialog() {
+        if (mediaPlayer == null || currentVideo == null) return;
+        int initial = audioBoostPercent;
+        int[] selected = { initial };
+        LinearLayout content = vertical();
+        content.setPadding(dp(24), dp(8), dp(24), dp(8));
+        TextView value = text("Audio boost  " + initial + "%", 14, INK, true);
+        SeekBar level = new SeekBar(this);
+        level.setMax(100);
+        level.setProgress(initial - 100);
+        level.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        level.setThumbTintList(ColorStateList.valueOf(Color.WHITE));
+        content.addView(value);
+        content.addView(level, new LinearLayout.LayoutParams(-1, dp(44)));
+        level.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                selected[0] = 100 + progress;
+                value.setText("Audio boost  " + selected[0] + "%");
+                setAudioBoost(selected[0]);
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) {}
+            @Override public void onStopTrackingTouch(SeekBar bar) {}
+        });
+        AlertDialog dialog = new AlertDialog.Builder(this, R.style.PlayerPanelTheme)
+                .setTitle("Audio boost")
+                .setView(content)
+                .setPositiveButton("Apply", null)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Reset", null)
+                .create();
+        dialog.setOnCancelListener(ignored -> setAudioBoost(initial));
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                preferences.edit().putInt("audioBoostPercent", selected[0]).apply();
+                dialog.dismiss();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+                setAudioBoost(initial);
+                dialog.dismiss();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                selected[0] = 100;
+                level.setProgress(0);
+                preferences.edit().putInt("audioBoostPercent", 100).apply();
+                dialog.dismiss();
+            });
+        });
+        showPlayerPanel(dialog);
+    }
+
+    private void setAudioBoost(int percent) {
+        audioBoostPercent = clamp(percent, 100, 200);
+        if (mediaPlayer != null) {
+            try { mediaPlayer.setVolume(audioBoostPercent); }
+            catch (RuntimeException ignored) {}
+        }
+    }
+
+    private int currentVolumePercent() {
+        if (audioManager == null) return 0;
+        int maximum = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        int volume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+        if (maximum <= 0) return 0;
+        return volume >= maximum ? audioBoostPercent : Math.round(volume * 100f / maximum);
+    }
+
+    private void setGestureVolume(int percent) {
+        if (audioManager == null) return;
+        percent = clamp(percent, 0, 200);
+        int maximum = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        // Android's stream stops at 100%; LibVLC supplies the additional PCM gain.
+        setAudioBoost(Math.max(100, percent));
+        int volume = Math.round(Math.min(percent, 100) * maximum / 100f);
+        if (audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) != volume) {
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, volume, 0);
+        }
+    }
+
+    private AlertDialog showAudioDelayDialog() {
+        if (mediaPlayer == null || currentVideo == null) return null;
+        MediaPlayer selectedPlayer = mediaPlayer;
+        String videoUri = currentVideo.uri.toString();
+        int initial = clamp(preferences.getInt("audioDelayMs:" + videoUri, 0), -10000, 10000);
+        int[] selected = { initial };
+        LinearLayout content = vertical();
+        content.setPadding(dp(24), dp(8), dp(24), dp(8));
+        content.addView(text("Audio offset in seconds", 14, INK, true));
+        LinearLayout adjustments = horizontal();
+        EditText value = new EditText(this);
+        value.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_SIGNED | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        value.setSingleLine(true);
+        value.setSelectAllOnFocus(true);
+        value.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        value.setTextColor(INK);
+        value.setTextSize(20);
+        value.setGravity(Gravity.CENTER);
+        value.setContentDescription("Audio sync offset in seconds");
+        value.setText(AudioSync.formatDelay(initial));
+        value.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence text, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence text, int start, int before, int count) {}
+            @Override public void afterTextChanged(Editable text) {
+                try {
+                    selected[0] = AudioSync.parseDelayMs(text.toString());
+                    value.setError(null);
+                    if (mediaPlayer == selectedPlayer) selectedPlayer.setAudioDelay(selected[0] * 1000L);
+                } catch (IllegalArgumentException ignored) {
+                    // Allow an incomplete sign or decimal while the user is typing.
+                }
+            }
+        });
+        TextView decrease = playerTextButton("−", "Decrease audio delay by 0.1 seconds", v -> {
+            value.setText(AudioSync.formatDelay(AudioSync.adjustDelayMs(selected[0], -100)));
+            value.setSelection(value.length());
+        });
+        TextView increase = playerTextButton("+", "Increase audio delay by 0.1 seconds", v -> {
+            value.setText(AudioSync.formatDelay(AudioSync.adjustDelayMs(selected[0], 100)));
+            value.setSelection(value.length());
+        });
+        decrease.setTextSize(24);
+        increase.setTextSize(24);
+        decrease.setBackground(transportButtonBackground());
+        increase.setBackground(transportButtonBackground());
+        adjustments.addView(decrease, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        adjustments.addView(value, new LinearLayout.LayoutParams(0, dp(52), 1));
+        adjustments.addView(increase, new LinearLayout.LayoutParams(dp(48), dp(48)));
+        content.addView(adjustments, new LinearLayout.LayoutParams(-1, -2));
+        content.addView(text("−10 to +10 seconds · buttons adjust by 0.1 s", 12, INK, false));
+        AlertDialog dialog = new AlertDialog.Builder(this, R.style.PlayerPanelTheme)
+                .setTitle("Audio sync correction")
+                .setView(content)
+                .setPositiveButton("Apply", null)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Reset", null)
+                .create();
+        dialog.setOnCancelListener(ignored -> {
+            if (mediaPlayer == selectedPlayer) selectedPlayer.setAudioDelay(initial * 1000L);
+        });
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                try {
+                    selected[0] = AudioSync.parseDelayMs(value.getText().toString());
+                } catch (IllegalArgumentException error) {
+                    value.setError("Enter a number from −10 to +10 seconds");
+                    return;
+                }
+                preferences.edit().putInt("audioDelayMs:" + videoUri, selected[0]).apply();
+                dialog.dismiss();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+                if (mediaPlayer == selectedPlayer) selectedPlayer.setAudioDelay(initial * 1000L);
+                dialog.dismiss();
+            });
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                if (mediaPlayer == selectedPlayer) selectedPlayer.setAudioDelay(0);
+                preferences.edit().putInt("audioDelayMs:" + videoUri, 0).apply();
+                dialog.dismiss();
+            });
+        });
+        value.setOnEditorActionListener((view, action, event) -> {
+            if (action != EditorInfo.IME_ACTION_DONE) return false;
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).performClick();
+            return true;
+        });
+        showPlayerPanel(dialog);
+        return dialog;
     }
 
     private void pickSubtitleFile() {
+        launchTrackFilePicker(SUBTITLE_FILE_REQUEST, "*/*");
+    }
+
+    private void pickAudioFile() {
+        launchTrackFilePicker(AUDIO_FILE_REQUEST, "audio/*");
+    }
+
+    private void launchTrackFilePicker(int requestCode, String mimeType) {
         if (playerRoot == null || currentVideo == null) return;
-        subtitlePickerActive = true;
-        subtitlePickerVideoUri = currentVideo.uri.toString();
+        mediaPickerActive = true;
+        pickedTrackVideoUri = currentVideo.uri.toString();
         Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         pick.addCategory(Intent.CATEGORY_OPENABLE);
-        pick.setType("*/*");
+        pick.setType(mimeType);
         pick.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         try {
-            startActivityForResult(pick, SUBTITLE_FILE_REQUEST);
+            startActivityForResult(pick, requestCode);
         } catch (RuntimeException error) {
-            subtitlePickerActive = false;
+            mediaPickerActive = false;
+            pickedTrackVideoUri = null;
             Toast.makeText(this, "Storage picker is unavailable", Toast.LENGTH_SHORT).show();
         }
     }
@@ -1976,33 +2369,21 @@ public final class MainActivity extends Activity {
         if (value != null) loadExternalSubtitle(Uri.parse(value), currentVideo, false);
     }
 
+    private void loadSavedExternalAudio() {
+        if (currentVideo == null) return;
+        String value = preferences.getString("audioFileUri:" + currentVideo.uri, null);
+        if (value != null) loadExternalAudio(Uri.parse(value), currentVideo, false);
+    }
+
     private void loadExternalSubtitle(Uri uri, VideoItem video, boolean persist) {
         MediaPlayer player = mediaPlayer;
         if (player == null) return;
         int generation = ++subtitleLoadGeneration;
         io.execute(() -> {
             File subtitleFile = null;
-            String name = subtitleDisplayName(uri);
+            String name = externalTrackDisplayName(uri, "External subtitle.srt");
             try {
-                String lowerName = name.toLowerCase(Locale.ROOT);
-                int dot = lowerName.lastIndexOf('.');
-                String suffix = dot >= 0 ? lowerName.substring(dot) : ".srt";
-                if (!suffix.matches("\\.[a-z0-9]{1,8}")) suffix = ".srt";
-                subtitleFile = File.createTempFile("subtitle-", suffix, getCacheDir());
-                try (InputStream source = getContentResolver().openInputStream(uri);
-                     FileOutputStream destination = new FileOutputStream(subtitleFile)) {
-                    if (source == null) throw new IOException("Cannot open subtitle");
-                    byte[] buffer = new byte[8192];
-                    int bytes;
-                    long total = 0;
-                    while ((bytes = source.read(buffer)) != -1) {
-                        if (Thread.currentThread().isInterrupted()) throw new IOException("Import cancelled");
-                        total += bytes;
-                        if (total > 16 * 1024 * 1024) throw new IOException("Subtitle file is too large");
-                        destination.write(buffer, 0, bytes);
-                    }
-                    if (total == 0) throw new IOException("Subtitle is empty");
-                }
+                subtitleFile = copyExternalTrack(uri, "subtitle-", name, ".srt", 16L * 1024 * 1024);
             } catch (IOException | RuntimeException error) {
                 if (subtitleFile != null) subtitleFile.delete();
                 runOnUiThread(() -> {
@@ -2028,7 +2409,7 @@ public final class MainActivity extends Activity {
                     Toast.makeText(this, "This subtitle could not be loaded", Toast.LENGTH_LONG).show();
                     return;
                 }
-                importedSubtitleFiles.add(imported);
+                importedTrackFiles.add(imported);
                 if (persist) {
                     preferences.edit().putString("subtitleFileUri:" + video.uri, uri.toString())
                             .putString("subtitleFileName:" + video.uri, name)
@@ -2040,13 +2421,85 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private String subtitleDisplayName(Uri uri) {
+    private void loadExternalAudio(Uri uri, VideoItem video, boolean persist) {
+        MediaPlayer player = mediaPlayer;
+        if (player == null) return;
+        int generation = ++audioLoadGeneration;
+        io.execute(() -> {
+            File audioFile = null;
+            String name = externalTrackDisplayName(uri, "External audio track.m4a");
+            try {
+                audioFile = copyExternalTrack(uri, "audio-track-", name, ".m4a", 1024L * 1024 * 1024);
+            } catch (IOException | RuntimeException error) {
+                if (audioFile != null) audioFile.delete();
+                runOnUiThread(() -> {
+                    if (currentVideo == video && generation == audioLoadGeneration) {
+                        Toast.makeText(this, "Could not read audio track", Toast.LENGTH_LONG).show();
+                    }
+                });
+                return;
+            }
+            File imported = audioFile;
+            runOnUiThread(() -> {
+                if (currentVideo != video || mediaPlayer != player || playerRoot == null
+                        || generation != audioLoadGeneration) {
+                    imported.delete();
+                    return;
+                }
+                boolean added = player.addSlave(IMedia.Slave.Type.Audio, Uri.fromFile(imported), true);
+                if (!added) {
+                    imported.delete();
+                    Toast.makeText(this, "This audio track could not be loaded", Toast.LENGTH_LONG).show();
+                    return;
+                }
+                importedTrackFiles.add(imported);
+                player.setAudioDelay(preferences.getInt("audioDelayMs:" + video.uri, 0) * 1000L);
+                if (persist) {
+                    preferences.edit().putString("audioFileUri:" + video.uri, uri.toString())
+                            .putString("audioFileName:" + video.uri, name)
+                            .putInt("vlcAudioTrack:" + video.uri, -2).apply();
+                }
+                updateTrackControls(player);
+                if (persist) Toast.makeText(this, "Loaded " + name, Toast.LENGTH_SHORT).show();
+            });
+        });
+    }
+
+    private File copyExternalTrack(Uri uri, String prefix, String name, String fallbackSuffix,
+                                   long maximumBytes) throws IOException {
+        String lowerName = name.toLowerCase(Locale.ROOT);
+        int dot = lowerName.lastIndexOf('.');
+        String suffix = dot >= 0 ? lowerName.substring(dot) : fallbackSuffix;
+        if (!suffix.matches("\\.[a-z0-9]{1,8}")) suffix = fallbackSuffix;
+        File file = File.createTempFile(prefix, suffix, getCacheDir());
+        boolean complete = false;
+        try (InputStream source = getContentResolver().openInputStream(uri);
+             FileOutputStream destination = new FileOutputStream(file)) {
+            if (source == null) throw new IOException("Cannot open selected track");
+            byte[] buffer = new byte[32 * 1024];
+            int bytes;
+            long total = 0;
+            while ((bytes = source.read(buffer)) != -1) {
+                if (Thread.currentThread().isInterrupted()) throw new IOException("Import cancelled");
+                total += bytes;
+                if (total > maximumBytes) throw new IOException("Selected track is too large");
+                destination.write(buffer, 0, bytes);
+            }
+            if (total == 0) throw new IOException("Selected track is empty");
+            complete = true;
+            return file;
+        } finally {
+            if (!complete) file.delete();
+        }
+    }
+
+    private String externalTrackDisplayName(Uri uri, String fallback) {
         String name = null;
         try (Cursor cursor = getContentResolver().query(uri, new String[] { OpenableColumns.DISPLAY_NAME }, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) name = cursor.getString(0);
         } catch (RuntimeException ignored) {}
         if (name == null || name.trim().isEmpty()) name = uri.getLastPathSegment();
-        return name == null ? "External subtitle.srt" : name;
+        return name == null ? fallback : name;
     }
 
     private void applyImmersiveMode() {
@@ -2066,10 +2519,13 @@ public final class MainActivity extends Activity {
         if (controlsTop != null) controlsTop.setVisibility(visible ? View.VISIBLE : View.GONE);
         if (controlsBottom != null) controlsBottom.setVisibility(visible ? View.VISIBLE : View.GONE);
         if (touchLockOverlay != null) touchLockOverlay.setVisibility(touchLocked ? View.VISIBLE : View.GONE);
+        if (lockButton != null) lockButton.setVisibility(visible ? View.VISIBLE : View.GONE);
     }
 
     private void setTouchLocked(boolean locked) {
         touchLocked = locked;
+        seekQueue.cancelPreviews();
+        if (scrubPreviewActive) seekTo(displayedSeekPositionMs);
         activeGesture = GESTURE_NONE;
         seeking = false;
         handler.removeCallbacks(hideControls);
@@ -2090,6 +2546,8 @@ public final class MainActivity extends Activity {
     }
 
     private int safePosition() {
+        int committedTarget = seekQueue.committedTarget();
+        if (committedTarget >= 0) return committedTarget;
         if (mediaPlayer == null || !mediaPrepared) return Math.max(0, savedPositionMs);
         try { return Math.max(0, (int) Math.min(Integer.MAX_VALUE, mediaPlayer.getTime())); }
         catch (RuntimeException ignored) { return 0; }
@@ -2097,7 +2555,8 @@ public final class MainActivity extends Activity {
 
     private void updatePlaybackIcon() {
         if (playPauseButton == null) return;
-        boolean playing = mediaPlayer != null && mediaPrepared && mediaPlayer.isPlaying();
+        boolean playing = scrubPreviewActive ? playWhenReady
+                : mediaPlayer != null && mediaPrepared && mediaPlayer.isPlaying();
         playPauseButton.setImageResource(playing ? R.drawable.ic_pause : R.drawable.ic_play);
         playPauseButton.setContentDescription(playing ? "Pause" : "Play");
     }
@@ -2134,12 +2593,16 @@ public final class MainActivity extends Activity {
         float[] speeds = new float[] { 1.0f, 1.25f, 1.5f, 2.0f, 0.75f };
         speedIndex = (speedIndex + 1) % speeds.length;
         speed = speeds[speedIndex];
-        speedButton.setText(String.format(Locale.US, "%.2gx", speed));
+        updateSpeedButton();
         if (mediaPlayer != null && mediaPrepared) {
             try { mediaPlayer.setRate(speed); }
             catch (RuntimeException ignored) {}
         }
         scheduleHideControls();
+    }
+
+    private void updateSpeedButton() {
+        if (speedButton != null) speedButton.setText(String.format(Locale.US, "%.2gx", speed));
     }
 
     private void toggleOrientation() {
@@ -2192,11 +2655,33 @@ public final class MainActivity extends Activity {
         handler.postDelayed(hideAdjustmentHud, 900);
     }
 
+    private void showSeekHud(int positionMs) {
+        displayedSeekPositionMs = clamp(positionMs, 0, durationMs);
+        if (adjustmentHud == null || touchLocked) return;
+        adjustmentHud.setText(formatTime(displayedSeekPositionMs) + " / " + formatTime(durationMs));
+        adjustmentHud.setVisibility(View.VISIBLE);
+        handler.removeCallbacks(hideAdjustmentHud);
+    }
+
+    private void finishScrubPreview() {
+        scrubPreviewActive = false;
+        if (seekFrameMonitor != null) seekFrameMonitor.close();
+        seekFrameMonitor = null;
+        seekQueue.endGesture();
+        updatePlaybackIcon();
+        handler.removeCallbacks(hideAdjustmentHud);
+        handler.postDelayed(hideAdjustmentHud, 900);
+        scheduleHideControls();
+    }
+
     private void finishPlayerGesture(boolean commitSeek) {
-        if (activeGesture == GESTURE_SEEK && commitSeek && mediaPlayer != null && mediaPrepared) {
-            savedPositionMs = gestureTargetPosition;
-            seekTo(savedPositionMs);
+        if (activeGesture == GESTURE_SEEK) {
+            // Commit precisely once; a cancelled drag returns to its original position.
+            seekTo(commitSeek ? gestureTargetPosition : gestureStartPosition);
+            seeking = false;
             scheduleHideControls();
+        } else if (activeGesture == GESTURE_VOLUME) {
+            preferences.edit().putInt("audioBoostPercent", audioBoostPercent).apply();
         }
         activeGesture = GESTURE_NONE;
     }
@@ -2204,7 +2689,39 @@ public final class MainActivity extends Activity {
     private void seekTo(int positionMs) {
         if (mediaPlayer == null || !mediaPrepared || !mediaPlayer.isSeekable()) return;
         savedPositionMs = clamp(positionMs, 0, durationMs > 0 ? durationMs : Integer.MAX_VALUE);
-        mediaPlayer.setTime(savedPositionMs, false);
+        seekQueue.requestCommit(savedPositionMs);
+        scheduleSeekRequests();
+    }
+
+    private void scheduleSeekRequests() {
+        if (seekQueueScheduled) return;
+        seekQueueScheduled = true;
+        handler.post(processSeekRequests);
+    }
+
+    private int displayedVideoFrames(MediaPlayer player) {
+        IMedia media = player.getMedia();
+        if (media == null) return -1;
+        try {
+            IMedia.Stats stats = media.getStats();
+            return stats == null ? -1 : stats.displayedPictures;
+        } finally {
+            media.release();
+        }
+    }
+
+    private void reopenAfterStalledSeek(int positionMs) {
+        if (currentVideo == null || playerRoot == null) return;
+        float previousSpeed = speed;
+        int previousSpeedIndex = speedIndex;
+        boolean shouldPlay = playWhenReady;
+        boolean showControls = controlsVisible;
+        openVideo(currentVideo, positionMs);
+        speed = previousSpeed;
+        speedIndex = previousSpeedIndex;
+        playWhenReady = shouldPlay;
+        updateSpeedButton();
+        setControlsVisible(showControls);
     }
 
     private VideoItem adjacentVideo(int direction) {

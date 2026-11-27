@@ -22,7 +22,9 @@ import android.os.IBinder;
 import android.os.SystemClock;
 import android.widget.ImageView;
 import android.widget.BaseAdapter;
+import android.widget.EditText;
 import android.widget.ListView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 
 import java.io.File;
@@ -45,6 +47,7 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
     private VideoPreviewLoader reopened;
     private ServiceConnection watch;
     private boolean watching;
+    private boolean savedClockPreview;
 
     @Override public void onCreate(Bundle arguments) { super.onCreate(arguments); start(); }
 
@@ -169,6 +172,24 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             passed(report, "bundledVideoPlayback");
             awaitVideoFrame();
             passed(report, "renderedVideo");
+            onMain(this::checkTransportLayout);
+            savePlayerScreenshot("player-controls");
+            passed(report, "centeredTransportLayout");
+            checkLongSubtitleList(video, constructor);
+            passed(report, "subtitleListOpensAtOffWithManyTracks");
+            checkLiveSeek();
+            passed(report, "swipeSeekPreviewsBeforeRelease");
+            checkContinuousSeek(video, constructor);
+            passed(report, "continuousSwipeSeekRendersSoftwareAndHardwarePlus");
+            passed(report, "seekTimerMatchesDecodedFrames");
+            passed(report, "seekingKeepsPlaybackAndVolumeEnabled");
+            checkBoostedVolume();
+            passed(report, "hardwarePlusVolumeBoost");
+            checkSubtitleSelection();
+            passed(report, "subtitleSelectionMatchesPlayback");
+            passed(report, "transparentRightSideTrackPanels");
+            checkAudioSyncPanel();
+            passed(report, "editableAudioSyncOffset");
             checkTouchLock();
             passed(report, "touchLockBlocksAccidentalInput");
             onMain(() -> activity.moveTaskToBack(true));
@@ -185,7 +206,7 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             });
             waitForIdleSync();
             onMain(() -> {
-                require(!Boolean.TRUE.equals(field("touchLocked")), "Top-left lock did not unlock playback");
+                require(!Boolean.TRUE.equals(field("touchLocked")), "Bottom-left lock did not unlock playback");
                 require(((View) field("controlsBottom")).getVisibility() == View.VISIBLE, "Unlock did not restore controls");
             });
             passed(report, "touchLockSurvivesBackground");
@@ -212,6 +233,540 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
         sendStatus(0, progress);
     }
 
+    private void checkTransportLayout() {
+        call("setControlsVisible", new Class<?>[] {boolean.class}, true);
+        View previous = (View) field("previousVideoButton");
+        View play = (View) field("playPauseButton");
+        View next = (View) field("nextVideoButton");
+        View root = (View) field("playerRoot");
+        float density = activity.getResources().getDisplayMetrics().density;
+        int[] previousPosition = new int[2], playPosition = new int[2], nextPosition = new int[2], rootPosition = new int[2];
+        previous.getLocationOnScreen(previousPosition);
+        play.getLocationOnScreen(playPosition);
+        next.getLocationOnScreen(nextPosition);
+        root.getLocationOnScreen(rootPosition);
+        float transportCenter = (previousPosition[0] + nextPosition[0] + next.getWidth()) / 2f;
+        require(Math.abs(playPosition[0] + play.getWidth() / 2f - transportCenter) <= density,
+                "Play is not centered in the transport strip");
+        require(previous.getWidth() >= 48 * density && play.getHeight() >= 56 * density,
+                "Transport touch targets are too small");
+        require(nextPosition[0] + next.getWidth() - previousPosition[0] >= root.getWidth() - 100 * density,
+                "Transport rectangles do not fill the bottom bar outside the lock corner");
+        require(rootPosition[0] + root.getWidth() - nextPosition[0] - next.getWidth() <= 20 * density,
+                "Transport leaves too much empty space on the right");
+        int firstGap = playPosition[0] - previousPosition[0] - previous.getWidth();
+        int secondGap = nextPosition[0] - playPosition[0] - play.getWidth();
+        require(firstGap >= 0 && firstGap <= 6 * density && secondGap >= 0 && secondGap <= 6 * density,
+                "Transport rectangles do not extend toward one another");
+        View lock = (View) field("lockButton");
+        int[] lockPosition = new int[2];
+        lock.getLocationOnScreen(lockPosition);
+        require(lockPosition[0] + lock.getWidth() < previousPosition[0], "Transport overlaps the bottom-left lock");
+        for (View view : new View[] {previous, play, next}) {
+            ImageView icon = (ImageView) view;
+            android.graphics.drawable.Drawable drawable = icon.getDrawable();
+            android.graphics.RectF bounds = new android.graphics.RectF(0, 0,
+                    drawable.getIntrinsicWidth(), drawable.getIntrinsicHeight());
+            icon.getImageMatrix().mapRect(bounds);
+            require(Math.abs(icon.getPaddingLeft() + bounds.centerX() - icon.getWidth() / 2f) <= density,
+                    "Playback icon is not centered horizontally inside its rectangle");
+            require(Math.abs(icon.getPaddingTop() + bounds.centerY() - icon.getHeight() / 2f) <= density,
+                    "Playback icon is not centered vertically inside its rectangle");
+        }
+    }
+
+    private void checkLiveSeek() throws Exception {
+        AtomicReference<Long> down = new AtomicReference<>();
+        AtomicReference<Integer> start = new AtomicReference<>();
+        onMain(() -> {
+            call("setControlsVisible", new Class<?>[] {boolean.class}, false);
+            View root = (View) field("playerRoot");
+            start.set((Integer) call("safePosition", new Class<?>[0]));
+            down.set(SystemClock.uptimeMillis());
+            dispatchTouch(root, down.get(), down.get(), MotionEvent.ACTION_DOWN, root.getWidth() * .25f, root.getHeight() * .5f);
+            dispatchTouch(root, down.get(), down.get() + 32, MotionEvent.ACTION_MOVE, root.getWidth() * .5f, root.getHeight() * .5f);
+        });
+        try {
+            long deadline = SystemClock.uptimeMillis() + 1800;
+            AtomicBoolean previewed = new AtomicBoolean();
+            while (!previewed.get() && SystemClock.uptimeMillis() < deadline) {
+                onMain(() -> previewed.set((Integer) call("safePosition", new Class<?>[0]) > start.get() + 3000));
+                Thread.sleep(60);
+            }
+            require(previewed.get(), "Video did not seek while the finger was still down");
+            onMain(() -> require(!((View) field("lockButton")).isShown(), "Seeking revealed the lock without the overlay"));
+            awaitVideoFrame();
+            savePlayerScreenshot("live-seek");
+        } finally {
+            onMain(() -> {
+                View root = (View) field("playerRoot");
+                dispatchTouch(root, down.get(), SystemClock.uptimeMillis(), MotionEvent.ACTION_UP,
+                        root.getWidth() * .5f, root.getHeight() * .5f);
+            });
+        }
+        onMain(() -> require(!Boolean.TRUE.equals(field("seeking")), "Seek gesture did not finish"));
+    }
+
+    private void checkContinuousSeek(Object originalVideo, Constructor<?> constructor) throws Exception {
+        File stress = new File(target.getFilesDir(), "seek-stress.mp4");
+        try (InputStream input = getContext().getAssets().open("seek-stress.mp4");
+             FileOutputStream output = new FileOutputStream(stress)) {
+            byte[] buffer = new byte[32768];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+        }
+        Object video = constructor.newInstance(Uri.fromFile(stress), "Continuous seek validation", "Validation", 40000L, stress.length());
+        Method open = MainActivity.class.getDeclaredMethod("openVideo", video.getClass(), int.class);
+        open.setAccessible(true);
+        try {
+            onMain(() -> invoke(open, video, 2000));
+            awaitPlayerPrepared();
+            for (int mode : new int[] {0, 2}) {
+                onMain(() -> call("setDecoderMode", new Class<?>[] {int.class}, mode));
+                awaitPlayerPrepared();
+                onMain(() -> call("seekTo", new Class<?>[] {int.class}, 2000));
+                awaitSeekPosition(2000);
+                awaitMovingVideo();
+                AtomicReference<Long> down = new AtomicReference<>();
+                AtomicReference<Integer> targetPosition = new AtomicReference<>();
+                AtomicReference<Integer> initialVolume = new AtomicReference<>();
+                java.util.HashSet<Integer> pictures = new java.util.HashSet<>();
+                int previewUpdates = 0;
+                int lastPreview = -1;
+                long lastPreviewAt = SystemClock.uptimeMillis();
+                long longestPreviewGap = 0;
+                onMain(() -> {
+                    org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+                    initialVolume.set(player.getVolume());
+                    require(player.getAudioTrack() >= 0, "Streaming seek fixture has no audio track");
+                    call("setControlsVisible", new Class<?>[] {boolean.class}, false);
+                    View root = (View) field("playerRoot");
+                    down.set(SystemClock.uptimeMillis());
+                    dispatchTouch(root, down.get(), down.get(), MotionEvent.ACTION_DOWN,
+                            root.getWidth() * .12f, root.getHeight() * .45f);
+                });
+                try {
+                    for (int step = 1; step <= 32; step++) {
+                        final float fraction = .12f + .38f * step / 32f;
+                        onMain(() -> {
+                            View root = (View) field("playerRoot");
+                            dispatchTouch(root, down.get(), SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE,
+                                    root.getWidth() * fraction, root.getHeight() * .45f);
+                        });
+                        Thread.sleep(55);
+                        AtomicReference<Integer> preview = new AtomicReference<>();
+                        onMain(() -> preview.set((Integer) field("displayedSeekPositionMs")));
+                        if (preview.get() != lastPreview) {
+                            long now = SystemClock.uptimeMillis();
+                            if (lastPreview >= 0) longestPreviewGap = Math.max(longestPreviewGap, now - lastPreviewAt);
+                            lastPreviewAt = now;
+                            lastPreview = preview.get();
+                            previewUpdates++;
+                        }
+                        if (step % 8 == 0) {
+                            pictures.add(videoFrameSignature());
+                            requireSeekTimerMatchesPicture();
+                            onMain(() -> {
+                                org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+                                require(Boolean.TRUE.equals(field("playWhenReady")), "Seeking changed playback intent to paused");
+                                require(player.isPlaying(), "Seeking paused native video playback");
+                                require(player.getVolume() == initialVolume.get(), "Seeking muted or changed audio volume");
+                            });
+                        }
+                    }
+                    require(pictures.size() > 1, "Picture froze during continuous forward seeking in mode " + mode);
+                    Bundle metrics = new Bundle();
+                    metrics.putInt("seekPreviewUpdatesMode" + mode, previewUpdates);
+                    metrics.putLong("seekLongestPreviewGapMsMode" + mode, longestPreviewGap);
+                    sendStatus(0, metrics);
+                    require(previewUpdates >= 8, "Too few rendered seek updates during a continuous drag in mode " + mode);
+                    require(longestPreviewGap <= 750, "Rendered seek updates stalled for " + longestPreviewGap + " ms in mode " + mode);
+                    onMain(() -> targetPosition.set((Integer) field("gestureTargetPosition")));
+                    awaitSeekPosition(targetPosition.get());
+                    requireSeekTimerMatchesPicture();
+                } finally {
+                    onMain(() -> {
+                        View root = (View) field("playerRoot");
+                        dispatchTouch(root, down.get(), SystemClock.uptimeMillis(), MotionEvent.ACTION_UP,
+                                root.getWidth() * .5f, root.getHeight() * .45f);
+                    });
+                }
+                awaitSeekPosition(targetPosition.get());
+                awaitMovingVideo();
+            }
+            savePlayerScreenshot("continuous-seek");
+        } finally {
+            onMain(() -> call("setDecoderMode", new Class<?>[] {int.class}, 0));
+            onMain(() -> invoke(open, originalVideo, 6000));
+            awaitPlayerPrepared();
+        }
+    }
+
+    private void awaitSeekPosition(int expectedMs) throws Exception {
+        AtomicBoolean settled = new AtomicBoolean();
+        long deadline = SystemClock.uptimeMillis() + 10000;
+        while (!settled.get() && SystemClock.uptimeMillis() < deadline) {
+            onMain(() -> {
+                org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+                if (player != null && Boolean.TRUE.equals(field("mediaPrepared"))) {
+                    settled.set(!((SeekQueue) field("seekQueue")).hasWork() && Math.abs(player.getTime() - expectedMs) < 1800);
+                }
+            });
+            Thread.sleep(80);
+        }
+        require(settled.get(), "Seek did not settle near " + expectedMs + " ms");
+    }
+
+    private void awaitMovingVideo() throws Exception {
+        int first = videoFrameSignature();
+        long deadline = SystemClock.uptimeMillis() + 3000;
+        while (SystemClock.uptimeMillis() < deadline) {
+            Thread.sleep(140);
+            if (videoFrameSignature() != first) return;
+        }
+        throw new AssertionError("Decoded video picture stopped changing after seeking");
+    }
+
+    private int videoFrameSignature() throws Exception {
+        return java.util.Arrays.hashCode(videoFramePixels());
+    }
+
+    private int[] videoFramePixels() throws Exception {
+        Bitmap bitmap = Bitmap.createBitmap(160, 90, Bitmap.Config.ARGB_8888);
+        CountDownLatch ready = new CountDownLatch(1);
+        AtomicReference<Integer> result = new AtomicReference<>();
+        onMain(() -> {
+            SurfaceView surface = findSurface((View) field("videoLayout"));
+            require(surface != null && surface.getHolder().getSurface().isValid(), "Video surface is not ready");
+            PixelCopy.request(surface, bitmap, status -> { result.set(status); ready.countDown(); },
+                    new android.os.Handler(android.os.Looper.getMainLooper()));
+        });
+        try {
+            require(ready.await(3, TimeUnit.SECONDS) && result.get() == PixelCopy.SUCCESS, "Could not read decoded video frame");
+            int[] pixels = new int[160 * 90];
+            bitmap.getPixels(pixels, 0, 160, 0, 0, 160, 90);
+            return pixels;
+        } finally {
+            bitmap.recycle();
+        }
+    }
+
+    private int videoPictureTimeMs() throws Exception {
+        int[] pixels = videoFramePixels();
+        if (!savedClockPreview) {
+            savedClockPreview = true;
+            Bitmap snapshot = Bitmap.createBitmap(pixels, 160, 90, Bitmap.Config.ARGB_8888);
+            try (FileOutputStream output = new FileOutputStream(new File(target.getFilesDir(), "validation-clock-first.png"))) {
+                snapshot.compress(Bitmap.CompressFormat.PNG, 100, output);
+            } finally { snapshot.recycle(); }
+        }
+        int left = 160, right = -1, top = 90, lastColorRow = -1;
+        for (int y = 0; y < 90; y++) {
+            for (int x = 0; x < 160; x++) {
+                int pixel = pixels[y * 160 + x];
+                int maximum = Math.max(Color.red(pixel), Math.max(Color.green(pixel), Color.blue(pixel)));
+                int minimum = Math.min(Color.red(pixel), Math.min(Color.green(pixel), Color.blue(pixel)));
+                if (maximum - minimum > 64) {
+                    left = Math.min(left, x);
+                    right = Math.max(right, x);
+                    top = Math.min(top, y);
+                    lastColorRow = Math.max(lastColorRow, y);
+                }
+            }
+        }
+        require(right > left && lastColorRow > top, "Could not locate the test video inside the surface");
+        int width = right - left + 1;
+        int height = Math.min(90 - top, Math.round((lastColorRow - top + 1) * 720f / 656));
+        int middleFrame = readPictureClock(pixels, left, top, width, height, 352f / 720);
+        int bottomFrame = readPictureClock(pixels, left, top, width, height, 688f / 720);
+        require(middleFrame == bottomFrame, "Picture contains different decoded frame numbers across its height");
+        return Math.round(bottomFrame * 1000f / 24);
+    }
+
+    private int readPictureClock(int[] pixels, int left, int top, int width, int height, float bandCenter) {
+        int centerY = Math.max(1, Math.min(88, top + Math.round(height * bandCenter)));
+        int frame = 0;
+        for (int bit = 0; bit < 10; bit++) {
+            int centerX = Math.max(2, Math.min(157, left + Math.round((bit + .5f) * width / 10f)));
+            int pixel = pixels[centerY * 160 + centerX];
+            boolean white = Color.red(pixel) + Color.green(pixel) + Color.blue(pixel) > 384;
+            if (white) frame |= 1 << bit;
+            for (int y = centerY - 1; y <= centerY + 1; y++) {
+                for (int x = centerX - 2; x <= centerX + 2; x += 2) {
+                    int sample = pixels[y * 160 + x];
+                    require((Color.red(sample) + Color.green(sample) + Color.blue(sample) > 384) == white,
+                            "Decoded clock block contains inconsistent picture data");
+                }
+            }
+        }
+        return frame;
+    }
+
+    private void requireSeekTimerMatchesPicture() throws Exception {
+        AtomicReference<Integer> displayed = new AtomicReference<>();
+        int pictureTime = -1;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            pictureTime = videoPictureTimeMs();
+            onMain(() -> displayed.set((Integer) field("displayedSeekPositionMs")));
+            if (Math.abs(pictureTime - displayed.get()) <= 300) {
+                onMain(() -> {
+                    String time = (String) call("formatTime", new Class<?>[] {int.class}, displayed.get());
+                    require(((TextView) field("adjustmentHud")).getText().toString().startsWith(time + " / "),
+                            "Seek timer does not show the rendered picture time");
+                });
+                return;
+            }
+            Thread.sleep(24);
+        }
+        throw new AssertionError("Seek timer " + displayed.get() + " ms differs from decoded picture " + pictureTime + " ms");
+    }
+
+
+    private void checkBoostedVolume() throws Exception {
+        AudioManager audio = (AudioManager) target.getSystemService(Context.AUDIO_SERVICE);
+        int originalVolume = audio.getStreamVolume(AudioManager.STREAM_MUSIC);
+        try {
+            onMain(() -> call("setDecoderMode", new Class<?>[] {int.class}, 2));
+            awaitPlayerPrepared();
+            onMain(() -> {
+                call("setControlsVisible", new Class<?>[] {boolean.class}, false);
+                call("setGestureVolume", new Class<?>[] {int.class}, 100);
+                View root = (View) field("playerRoot");
+                touch(root, root.getWidth() * .85f, root.getHeight() * .85f,
+                        root.getWidth() * .85f, root.getHeight() * .25f);
+                org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+                require((Integer) field("audioBoostPercent") == 200, "Volume swipe did not unlock 200% in HW+");
+                require(player.getVolume() == 200, "Native player did not accept 200% gain");
+                require(((TextView) field("adjustmentHud")).getText().toString().contains("200%"), "Volume HUD did not show boost");
+                touch(root, root.getWidth() * .85f, root.getHeight() * .25f,
+                        root.getWidth() * .85f, root.getHeight() * .85f);
+                require((Integer) field("audioBoostPercent") == 100 && player.getVolume() == 100,
+                        "Lowering volume did not clear player gain below 100%");
+            });
+        } finally {
+            onMain(() -> {
+                call("setAudioBoost", new Class<?>[] {int.class}, 100);
+                audio.setStreamVolume(AudioManager.STREAM_MUSIC, originalVolume, 0);
+                call("setDecoderMode", new Class<?>[] {int.class}, 0);
+            });
+            awaitPlayerPrepared();
+        }
+    }
+
+    private void awaitPlayerPrepared() throws Exception {
+        AtomicBoolean ready = new AtomicBoolean();
+        long deadline = SystemClock.uptimeMillis() + 12000;
+        while (!ready.get() && SystemClock.uptimeMillis() < deadline) {
+            onMain(() -> ready.set(Boolean.TRUE.equals(field("mediaPrepared"))));
+            Thread.sleep(100);
+        }
+        require(ready.get(), "Player did not prepare after decoder change");
+    }
+
+    private void checkSubtitleSelection() throws Exception {
+        File subtitle = new File(target.getFilesDir(), "validation-subtitle.srt");
+        try (FileOutputStream output = new FileOutputStream(subtitle)) {
+            output.write("1\n00:00:00,000 --> 00:00:29,900\nSubtitle selection validation\n".getBytes("UTF-8"));
+        }
+        onMain(() -> call("loadExternalSubtitle", new Class<?>[] {Uri.class, field("currentVideo").getClass(), boolean.class},
+                Uri.fromFile(subtitle), field("currentVideo"), true));
+        AtomicBoolean selected = new AtomicBoolean();
+        long deadline = SystemClock.uptimeMillis() + 6000;
+        while (!selected.get() && SystemClock.uptimeMillis() < deadline) {
+            onMain(() -> selected.set(((org.videolan.libvlc.MediaPlayer) field("mediaPlayer")).getSpuTrack() >= 0));
+            Thread.sleep(100);
+        }
+        require(selected.get(), "External subtitle did not start");
+        AtomicReference<android.app.AlertDialog> dialog = new AtomicReference<>();
+        try {
+            onMain(() -> dialog.set((android.app.AlertDialog) call("showTrackSelection", new Class<?>[] {boolean.class}, true)));
+            waitForIdleSync();
+            onMain(() -> {
+                checkPlayerPanel(dialog.get());
+                ListView list = dialog.get().getListView();
+                require("Off".equals(list.getAdapter().getItem(0)), "Off is not the first subtitle option");
+                require(list.getFirstVisiblePosition() == 0, "Subtitle list did not open at Off");
+                require(list.getCheckedItemPosition() > 0, "Subtitle menu shows Off while a subtitle is running");
+            });
+            savePlayerScreenshot("subtitle-panel");
+            onMain(() -> {
+                ListView list = dialog.get().getListView();
+                list.performItemClick(list.getChildAt(0), 0, list.getAdapter().getItemId(0));
+            });
+            waitForIdleSync();
+            onMain(() -> {
+                org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+                require(player.getSpuTrack() == -1, "Selecting Off did not stop subtitles");
+                call("restoreTrackSelections", new Class<?>[] {org.videolan.libvlc.MediaPlayer.class}, player);
+                require(player.getSpuTrack() == -1, "Saved settings re-enabled subtitles after Off");
+                dialog.set((android.app.AlertDialog) call("showTrackSelection", new Class<?>[] {boolean.class}, true));
+                require(dialog.get().getListView().getCheckedItemPosition() == 0, "Subtitle menu did not reflect Off");
+            });
+        } finally {
+            onMain(() -> { if (dialog.get() != null) dialog.get().dismiss(); });
+        }
+        try {
+            onMain(() -> dialog.set((android.app.AlertDialog) call("showTrackSelection", new Class<?>[] {boolean.class}, false)));
+            waitForIdleSync();
+            onMain(() -> checkPlayerPanel(dialog.get()));
+            savePlayerScreenshot("audio-panel");
+        } finally {
+            onMain(() -> { if (dialog.get() != null) dialog.get().dismiss(); });
+        }
+    }
+
+    private void checkLongSubtitleList(Object originalVideo, Constructor<?> constructor) throws Exception {
+        File fixture = new File(target.getFilesDir(), "subtitle-tracks.mkv");
+        try (InputStream input = getContext().getAssets().open("subtitle-tracks.mkv");
+             FileOutputStream output = new FileOutputStream(fixture)) {
+            byte[] buffer = new byte[32768];
+            int count;
+            while ((count = input.read(buffer)) != -1) output.write(buffer, 0, count);
+        }
+        Object video = constructor.newInstance(Uri.fromFile(fixture), "Many subtitle tracks", "Validation", 30000L, fixture.length());
+        Method open = MainActivity.class.getDeclaredMethod("openVideo", video.getClass(), int.class);
+        open.setAccessible(true);
+        AtomicReference<android.app.AlertDialog> dialog = new AtomicReference<>();
+        try {
+            onMain(() -> invoke(open, video, 6000));
+            awaitPlayerPrepared();
+            AtomicBoolean ready = new AtomicBoolean();
+            long deadline = SystemClock.uptimeMillis() + 6000;
+            while (!ready.get() && SystemClock.uptimeMillis() < deadline) {
+                onMain(() -> {
+                    org.videolan.libvlc.MediaPlayer player = (org.videolan.libvlc.MediaPlayer) field("mediaPlayer");
+                    org.videolan.libvlc.MediaPlayer.TrackDescription[] tracks = player.getSpuTracks();
+                    if (tracks != null && tracks.length >= 16) {
+                        ready.set(player.setSpuTrack(tracks[tracks.length - 1].id));
+                    }
+                });
+                Thread.sleep(100);
+            }
+            require(ready.get(), "Sixteen subtitle tracks were not available");
+            for (int attempt = 0; attempt < 3; attempt++) {
+                onMain(() -> dialog.set((android.app.AlertDialog) call("showTrackSelection", new Class<?>[] {boolean.class}, true)));
+                waitForIdleSync();
+                Thread.sleep(250);
+                onMain(() -> {
+                    ListView list = dialog.get().getListView();
+                    require("Off".equals(list.getAdapter().getItem(0)), "Off is not the first subtitle option");
+                    require(list.getFirstVisiblePosition() == 0, "Subtitle list scrolled to the active track instead of Off");
+                    require(list.getCheckedItemPosition() == 16, "Subtitle list does not mark the active last track");
+                    TextView first = findText(list.getChildAt(0), "Off");
+                    require(first != null && first.isShown(), "Off is not visible when the subtitle list opens");
+                    dialog.get().dismiss();
+                });
+            }
+            onMain(() -> dialog.set((android.app.AlertDialog) call("showTrackSelection", new Class<?>[] {boolean.class}, true)));
+            waitForIdleSync();
+            onMain(() -> {
+                ListView list = dialog.get().getListView();
+                list.performItemClick(list.getChildAt(0), 0, list.getAdapter().getItemId(0));
+                require(((org.videolan.libvlc.MediaPlayer) field("mediaPlayer")).getSpuTrack() == -1,
+                        "Off did not disable the last subtitle track");
+            });
+        } finally {
+            onMain(() -> {
+                if (dialog.get() != null) dialog.get().dismiss();
+                invoke(open, originalVideo, 6000);
+            });
+            awaitPlayerPrepared();
+        }
+    }
+
+    private void checkPlayerPanel(android.app.AlertDialog dialog) {
+        android.view.Window window = dialog.getWindow();
+        require(window != null, "Player panel has no window");
+        android.view.WindowManager.LayoutParams params = window.getAttributes();
+        require((params.gravity & android.view.Gravity.HORIZONTAL_GRAVITY_MASK) == android.view.Gravity.RIGHT,
+                "Player panel is not aligned to the right");
+        require((params.flags & android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND) == 0,
+                "Player panel dims the video");
+        android.graphics.drawable.Drawable background = window.getDecorView().getBackground();
+        require(background instanceof android.graphics.drawable.ColorDrawable
+                        && Color.alpha(((android.graphics.drawable.ColorDrawable) background).getColor()) == 0,
+                "Player panel background is not transparent");
+    }
+
+    private void checkAudioSyncPanel() throws Exception {
+        AtomicReference<android.app.AlertDialog> dialog = new AtomicReference<>();
+        String key = "audioDelayMs:" + Uri.fromFile(new File(target.getFilesDir(), "preview-fixture.mp4"));
+        try {
+            onMain(() -> dialog.set((android.app.AlertDialog) call("showAudioDelayDialog", new Class<?>[0])));
+            waitForIdleSync();
+            onMain(() -> {
+                checkPlayerPanel(dialog.get());
+                View decor = dialog.get().getWindow().getDecorView();
+                EditText input = findViewOfType(decor, EditText.class);
+                require(input != null, "Audio sync has no editable number");
+                require(findViewOfType(decor, SeekBar.class) == null, "Audio sync still uses a slider");
+                input.setText("");
+                dialog.get().getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick();
+                require(dialog.get().isShowing() && input.getError() != null, "Empty audio offset was accepted");
+                input.setText("-0.25");
+                findByDescription(decor, "Increase audio delay by 0.1 seconds").performClick();
+                require("-0.15".equals(input.getText().toString()), "Plus did not add 0.1 seconds");
+                findByDescription(decor, "Decrease audio delay by 0.1 seconds").performClick();
+                require("-0.25".equals(input.getText().toString()), "Minus did not subtract 0.1 seconds");
+                input.setText("+0.125");
+                require(((org.videolan.libvlc.MediaPlayer) field("mediaPlayer")).getAudioDelay() == 125000L,
+                        "Typed offset was not applied to the player");
+            });
+            savePlayerScreenshot("audio-sync-panel");
+            onMain(() -> {
+                dialog.get().getButton(android.app.AlertDialog.BUTTON_POSITIVE).performClick();
+                require(((SharedPreferences) field("preferences")).getInt(key, 0) == 125, "Typed offset was not saved");
+                dialog.set((android.app.AlertDialog) call("showAudioDelayDialog", new Class<?>[0]));
+                EditText input = findViewOfType(dialog.get().getWindow().getDecorView(), EditText.class);
+                require(input != null && "+0.125".equals(input.getText().toString()), "Saved offset lost its precision");
+            });
+            waitForIdleSync();
+            onMain(() -> {
+                dialog.get().getButton(android.app.AlertDialog.BUTTON_NEUTRAL).performClick();
+                require(((SharedPreferences) field("preferences")).getInt(key, -1) == 0, "Reset did not clear audio sync");
+            });
+        } finally {
+            onMain(() -> { if (dialog.get() != null) dialog.get().dismiss(); });
+        }
+    }
+
+    private <T extends View> T findViewOfType(View view, Class<T> type) {
+        if (type.isInstance(view)) return type.cast(view);
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                T found = findViewOfType(group.getChildAt(i), type);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private View findByDescription(View view, String description) {
+        if (description.contentEquals(view.getContentDescription() == null ? "" : view.getContentDescription())) return view;
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View found = findByDescription(group.getChildAt(i), description);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private void savePlayerScreenshot(String name) throws Exception {
+        waitForIdleSync();
+        // Idle does not wait for the window compositor's dialog transition.
+        Thread.sleep(350);
+        Bitmap screenshot = getUiAutomation().takeScreenshot();
+        require(screenshot != null, "Could not capture player layout");
+        try (FileOutputStream output = new FileOutputStream(new File(target.getFilesDir(), "validation-" + name + ".png"))) {
+            screenshot.compress(Bitmap.CompressFormat.PNG, 100, output);
+        } finally {
+            screenshot.recycle();
+        }
+    }
+
     private void checkTouchLock() throws Exception {
         onMain(() -> {
             call("setControlsVisible", new Class<?>[] {boolean.class}, true);
@@ -226,8 +781,12 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
             position.set((Integer) call("safePosition", new Class<?>[0]));
             volume.set(((AudioManager) field("audioManager")).getStreamVolume(AudioManager.STREAM_MUSIC));
             brightness.set(activity.getWindow().getAttributes().screenBrightness);
-            View lock = findDescription((View) field("controlsTop"), "Lock playback touches");
-            require(lock != null && lock.isShown(), "Lock control is unavailable");
+            View lock = (View) field("lockButton");
+            require(lock.isShown(), "Bottom-left lock control is unavailable");
+            call("setControlsVisible", new Class<?>[] {boolean.class}, false);
+            require(!lock.isShown(), "Bottom-left lock remained visible without the playback overlay");
+            call("setControlsVisible", new Class<?>[] {boolean.class}, true);
+            require(lock.isShown(), "Bottom-left lock did not return with the playback overlay");
             tapCenter(lock);
         });
         waitForIdleSync();
@@ -267,7 +826,7 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
         });
         waitForIdleSync();
         onMain(() -> {
-            tapCenter(findDescription((View) field("controlsTop"), "Lock playback touches"));
+            tapCenter((View) field("lockButton"));
         });
         waitForIdleSync();
         onMain(this::checkLocked);
@@ -277,6 +836,7 @@ public final class StartupSmokeInstrumentation extends Instrumentation {
         require(Boolean.TRUE.equals(field("touchLocked")), "Playback touch lock was lost");
         require(((View) field("touchLockOverlay")).isShown(), "Touch guard is hidden");
         require(((View) field("unlockButton")).isShown(), "Unlock button is hidden");
+        require(!((View) field("lockButton")).isShown(), "Locked player still shows the lock button");
         require(((View) field("controlsTop")).getVisibility() == View.GONE, "Locked touches revealed top controls");
         require(((View) field("controlsBottom")).getVisibility() == View.GONE, "Locked touches revealed bottom controls");
         require(((View) field("adjustmentHud")).getVisibility() == View.GONE, "Locked touches revealed gesture feedback");

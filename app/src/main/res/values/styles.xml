@@ -9,4 +9,16 @@
         <item name="android:windowBackground">#070A10</item>
         <item name="android:windowActionModeOverlay">true</item>
     </style>
+    <style name="PlayerPanelTheme" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#268BFF</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:colorBackground">@android:color/transparent</item>
+        <item name="android:colorBackgroundFloating">@android:color/transparent</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:backgroundDimAmount">0</item>
+        <item name="android:windowElevation">0dp</item>
+        <item name="android:textColorPrimary">#F2F6FC</item>
+        <item name="android:textColorSecondary">#F2F6FC</item>
+    </style>
 </resources>
